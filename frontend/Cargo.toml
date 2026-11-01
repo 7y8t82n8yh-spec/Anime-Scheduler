@@ -4,6 +4,7 @@ description = "Anime Scheduler browser UI, written in Rust and compiled to WebAs
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 anime-shared.workspace = true
@@ -15,6 +16,5 @@ js-sys = "0.3"
 leptos = { version = "0.8", features = ["csr"] }
 serde.workspace = true
 wasm-bindgen-futures = "0.4"
-serde_json.workspace = true
 wasm-bindgen = "=0.2.130"
 web-sys = { version = "0.3", features = ["Notification", "NotificationOptions", "NotificationPermission", "Storage", "Window", "Location", "History", "HtmlInputElement", "HtmlSelectElement", "HtmlDetailsElement", "FormData", "HtmlFormElement"] }

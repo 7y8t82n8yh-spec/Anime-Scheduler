@@ -1,15 +1,17 @@
 //! HTTP API and static frontend.
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, Request, State},
+    http::{Method, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, patch, post},
+    routing::{any, get, patch, post},
     Json, Router,
 };
 use chrono::Utc;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
@@ -17,7 +19,7 @@ use crate::{
     model::{
         AddReq, Anime, AnimeView, ErrorResp, FromMedia, ImportReq, ImportResp, MalStatus,
         NotificationsResp, ReadReq, RefreshResp, SearchResult, UpdateReq, UpdateResp, WatchReq,
-        WatchStatus,
+        WatchStatus, CSRF_HEADER, CSRF_HEADER_VALUE,
     },
     poller, SharedState,
 };
@@ -42,8 +44,41 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/mal/disconnect", post(mal_disconnect))
         .route("/auth/mal/login", get(mal_login))
         .route("/auth/mal/callback", get(mal_callback))
+        .route(
+            "/api/{*rest}",
+            any(|| async { AppError(StatusCode::NOT_FOUND, "no such API endpoint".into()) }),
+        )
         .fallback_service(frontend)
+        .layer(middleware::from_fn(csrf_guard))
         .with_state(state)
+}
+
+/// How long a started MAL login stays valid.
+const OAUTH_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Blocks cross-site requests that could change state (CSRF): every non-GET request
+/// must carry [`CSRF_HEADER`] and not be marked cross-site by the browser, and the MAL
+/// login can't be started from another site.
+async fn csrf_guard(req: Request, next: Next) -> Response {
+    let headers = req.headers();
+    let cross_site = matches!(
+        headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()),
+        Some("cross-site" | "same-site")
+    );
+    let safe_method = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    let has_header = headers
+        .get(CSRF_HEADER)
+        .is_some_and(|v| v.as_bytes() == CSRF_HEADER_VALUE.as_bytes());
+    let blocked = if safe_method {
+        cross_site && req.uri().path() == "/auth/mal/login"
+    } else {
+        cross_site || !has_header
+    };
+    if blocked {
+        return AppError(StatusCode::FORBIDDEN, "cross-site request blocked".into())
+            .into_response();
+    }
+    next.run(req).await
 }
 
 pub struct AppError(StatusCode, String);
@@ -55,11 +90,30 @@ impl AppError {
     fn not_found() -> Self {
         Self(StatusCode::NOT_FOUND, "anime not in your list".into())
     }
+    fn internal(e: &anyhow::Error) -> Self {
+        tracing::error!("{e:#}");
+        Self(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save: {e:#}"),
+        )
+    }
 }
 
+/// Errors from upstream services (AniList, MyAnimeList) are reported as 502.
 impl<E: Into<anyhow::Error>> From<E> for AppError {
     fn from(e: E) -> Self {
         Self(StatusCode::BAD_GATEWAY, format!("{:#}", e.into()))
+    }
+}
+
+/// Map a local storage failure to a 500 (instead of the upstream 502).
+trait OrInternal<T> {
+    fn or_internal(self) -> Result<T, AppError>;
+}
+
+impl<T> OrInternal<T> for anyhow::Result<T> {
+    fn or_internal(self) -> Result<T, AppError> {
+        self.map_err(|e| AppError::internal(&e))
     }
 }
 
@@ -98,11 +152,43 @@ async fn add_anime(
         .first()
         .ok_or_else(|| AppError::bad_request("no such anime on AniList"))?;
     let now = Utc::now();
-    let anime = Anime::from_media(m, req.status, now);
-    s.store
-        .mutate(|d| d.anime.insert(anime.anilist_id, anime.clone()))
-        .await?;
-    let mal_error = s.sync_to_mal(&anime).await;
+    let mut anime = Anime::from_media(m, req.status, now);
+
+    // If the show is already on the user's MAL list, adopt that progress instead of
+    // overwriting it; otherwise add it to MAL with the chosen status.
+    let mut mal_error = None;
+    if let (Some(mal), Some(mal_id)) = (&s.mal, anime.mal_id) {
+        match s.mal_token().await {
+            Ok(Some(token)) => match mal.my_list_status(&token, mal_id).await {
+                Ok(Some((status, watched))) => {
+                    anime.import_progress(watched, status.unwrap_or(req.status));
+                }
+                Ok(None) => mal_error = s.sync_to_mal(&anime).await,
+                Err(e) => mal_error = Some(format!("couldn't check your MyAnimeList entry: {e:#}")),
+            },
+            Ok(None) => {}
+            Err(e) => mal_error = Some(format!("{e:#}")),
+        }
+    }
+
+    let inserted = s
+        .store
+        .mutate(|d| {
+            let fresh = !d.anime.contains_key(&anime.anilist_id);
+            if fresh {
+                d.anime.insert(anime.anilist_id, anime.clone());
+            }
+            fresh
+        })
+        .await
+        .or_internal()?;
+    if !inserted {
+        return Err(AppError::bad_request(format!(
+            "{} is already in your list",
+            anime.title
+        )));
+    }
+    s.reschedule.notify_one();
     Ok(Json(UpdateResp {
         anime: AnimeView::new(anime, now),
         mal_error,
@@ -127,7 +213,8 @@ async fn update_anime(
             }
             Some(a.clone())
         })
-        .await?
+        .await
+        .or_internal()?
         .ok_or_else(AppError::not_found)?;
     let mal_error = s.sync_to_mal(&anime).await;
     Ok(Json(UpdateResp {
@@ -148,11 +235,15 @@ async fn log_watch(
         .mutate(|d| {
             let a = d.anime.get_mut(&id)?;
             let ep = req.episode.unwrap_or(a.watched + 1);
-            a.log_watch(ep, req.watched_at.unwrap_or(now));
-            Some(a.clone())
+            Some(
+                a.log_watch(ep, req.watched_at.unwrap_or(now))
+                    .map(|()| a.clone()),
+            )
         })
-        .await?
-        .ok_or_else(AppError::not_found)?;
+        .await
+        .or_internal()?
+        .ok_or_else(AppError::not_found)?
+        .map_err(AppError::bad_request)?;
     let mal_error = s.sync_to_mal(&anime).await;
     Ok(Json(UpdateResp {
         anime: AnimeView::new(anime, now),
@@ -161,7 +252,11 @@ async fn log_watch(
 }
 
 async fn remove_anime(State(s): State<SharedState>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    let removed = s.store.mutate(|d| d.anime.remove(&id)).await?;
+    let removed = s
+        .store
+        .mutate(|d| d.anime.remove(&id))
+        .await
+        .or_internal()?;
     Ok(if removed.is_some() {
         StatusCode::NO_CONTENT
     } else {
@@ -204,8 +299,8 @@ async fn search(
 
 async fn refresh(State(s): State<SharedState>) -> ApiResult<Json<RefreshResp>> {
     let created = poller::refresh_all(&s).await?;
-    // Let the poller recompute its schedule against the fresh data.
-    s.refresh_now.notify_one();
+    // Let the poller recompute when to wake up against the fresh data.
+    s.reschedule.notify_one();
     Ok(Json(RefreshResp {
         new_notifications: created,
     }))
@@ -233,12 +328,16 @@ async fn mark_read(
                 }
             }
         })
-        .await?;
+        .await
+        .or_internal()?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn clear_notifications(State(s): State<SharedState>) -> ApiResult<StatusCode> {
-    s.store.mutate(|d| d.notifications.clear()).await?;
+    s.store
+        .mutate(|d| d.notifications.clear())
+        .await
+        .or_internal()?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -321,20 +420,19 @@ async fn mal_import(
                             .or_insert_with(|| Anime::from_media(m, status, now))
                     }
                 };
-                // MAL is the source of truth on import; don't invent watch timestamps.
-                a.status = status;
                 a.mal_id = Some(e.mal_id);
-                a.watched = e.watched;
-                a.watch_log.retain(|w| w.episode <= e.watched);
+                a.import_progress(e.watched, status);
             }
             resp
         })
-        .await?;
+        .await
+        .or_internal()?;
+    s.reschedule.notify_one();
     Ok(Json(resp))
 }
 
 async fn mal_disconnect(State(s): State<SharedState>) -> ApiResult<StatusCode> {
-    s.store.mutate(|d| d.mal = None).await?;
+    s.store.mutate(|d| d.mal = None).await.or_internal()?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -346,10 +444,18 @@ async fn mal_login(State(s): State<SharedState>) -> ApiResult<Redirect> {
     let state: String = new_code_verifier().chars().take(32).collect();
     let url = mal.authorize_url(&verifier, &state, &s.config.mal_redirect_uri())?;
     let mut pending = s.pending_oauth.lock().await;
-    if pending.len() > 20 {
-        pending.clear();
+    pending.retain(|_, (_, created)| created.elapsed() < OAUTH_TTL);
+    // Bound memory if someone hammers this endpoint: drop the oldest pending login.
+    if pending.len() >= 50 {
+        if let Some(oldest) = pending
+            .iter()
+            .min_by_key(|(_, (_, c))| *c)
+            .map(|(k, _)| k.clone())
+        {
+            pending.remove(&oldest);
+        }
     }
-    pending.insert(state, verifier);
+    pending.insert(state, (verifier, Instant::now()));
     Ok(Redirect::to(&url))
 }
 
@@ -377,6 +483,8 @@ async fn mal_callback(State(s): State<SharedState>, Query(q): Query<CallbackQuer
             .lock()
             .await
             .remove(&state)
+            .filter(|(_, created)| created.elapsed() < OAUTH_TTL)
+            .map(|(verifier, _)| verifier)
             .ok_or_else(|| anyhow::anyhow!("login session expired, please try again"))?;
         let mut tokens = mal
             .exchange_code(&code, &verifier, &s.config.mal_redirect_uri())

@@ -4,6 +4,7 @@ description = "Types and pure logic shared by the Anime Scheduler server and its
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 chrono.workspace = true

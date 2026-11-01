@@ -13,3 +13,8 @@ backend = "http://127.0.0.1:3000/api/"
 
 [[proxy]]
 backend = "http://127.0.0.1:3000/auth/"
+
+# Tool versions. Trunk uses a matching binary on PATH, otherwise downloads it.
+[tools]
+wasm_bindgen = "0.2.130"
+wasm_opt = "version_116"

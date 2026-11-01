@@ -132,32 +132,18 @@ impl Ctx {
         });
 
         const KEY: &str = "lastAlertedId";
-        let max_id = data
-            .notifications
-            .iter()
-            .map(|n| n.id as i64)
-            .max()
-            .unwrap_or(-1);
         let prev = browser::storage_get(KEY).and_then(|v| v.parse::<i64>().ok());
-        if let Some(prev) = prev {
-            for n in data
-                .notifications
-                .iter()
-                .rev()
-                .filter(|n| !n.read && n.id as i64 > prev)
-            {
-                browser::show_notification(
-                    &n.title,
-                    &n.message,
-                    n.cover.as_deref(),
-                    &format!("anime-{}", n.id),
-                );
-            }
+        let (alerts, high_water) = pending_alerts(&data.notifications, prev);
+        for n in &alerts {
+            browser::show_notification(
+                &n.title,
+                &n.message,
+                n.cover.as_deref(),
+                &format!("anime-{}", n.id),
+            );
         }
-        if prev.is_none_or(|p| max_id > p) {
-            browser::storage_set(KEY, &max_id.to_string());
-        }
-        let new_arrived = prev.is_some_and(|p| max_id > p);
+        browser::storage_set(KEY, &high_water.to_string());
+        let new_arrived = prev.is_some_and(|p| high_water > p);
         self.notifications.set(Some(data));
         if new_arrived {
             self.reload_anime().await;
@@ -169,9 +155,24 @@ impl Ctx {
     where
         F: std::future::Future<Output = api::ApiResult<UpdateResp>> + 'static,
     {
+        self.update_with_message(fut, None);
+    }
+
+    /// Like [`Ctx::update_with`], showing `success` once the server confirms.
+    fn update_with_message<F>(self, fut: F, success: Option<String>)
+    where
+        F: std::future::Future<Output = api::ApiResult<UpdateResp>> + 'static,
+    {
         spawn_local(async move {
             match fut.await {
-                Ok(r) => self.apply(r),
+                Ok(r) => {
+                    let mal_failed = r.mal_error.is_some();
+                    self.apply(r);
+                    // Don't hide a MAL sync error toast behind the success message.
+                    if let (Some(msg), false) = (success, mal_failed) {
+                        self.toast(msg, false);
+                    }
+                }
                 Err(e) => self.error(e),
             }
         });
@@ -219,11 +220,13 @@ pub fn App() -> impl IntoView {
     Interval::new(30_000, move || {
         let now = Utc::now();
         ctx.now.set(now);
+        // Only active shows (the server refreshes those right after air time), and not
+        // long-overdue ones (AniList stopped updating them), to avoid a reload loop.
         let overdue = ctx.anime.with_untracked(|list| {
-            list.iter().any(|a| {
-                a.airing
-                    .next_airing_at
-                    .is_some_and(|t| t < now - chrono::Duration::minutes(3))
+            list.iter().filter(|a| a.status.is_active()).any(|a| {
+                a.airing.next_airing_at.is_some_and(|t| {
+                    t < now - chrono::Duration::minutes(3) && t > now - chrono::Duration::hours(1)
+                })
             })
         });
         if overdue {
@@ -428,7 +431,7 @@ fn AnimeList() -> impl IntoView {
             .unwrap_or(Tab::UpNext),
     );
 
-    let visible = move || {
+    let visible = Memo::new(move |_| {
         let now = ctx.now.get();
         let t = tab.get();
         let mut list: Vec<Anime> = ctx
@@ -444,7 +447,7 @@ fn AnimeList() -> impl IntoView {
                 .then_with(|| x.title.cmp(&y.title))
         });
         list
-    };
+    });
 
     view! {
         <nav class="tabs">
@@ -471,13 +474,13 @@ fn AnimeList() -> impl IntoView {
             <Show when=move || ctx.anime.with(|l| l.is_empty())>
                 <div class="empty">"Your list is empty — search above to add an anime, or import from MyAnimeList."</div>
             </Show>
-            <Show when=move || ctx.anime.with(|l| !l.is_empty()) && visible().is_empty()>
+            <Show when=move || ctx.anime.with(|l| !l.is_empty()) && visible.with(Vec::is_empty)>
                 <div class="empty">"Nothing here."</div>
             </Show>
-            // Keyed by the full entry, so a card re-renders only when its data changes.
+            // Keyed by what a card displays, so it re-renders only when that changes.
             <For
-                each=visible
-                key=|a| serde_json::to_string(a).unwrap_or_default()
+                each=move || visible.get()
+                key=Anime::display_hash
                 children=move |a| view! { <Card anime=a/> }
             />
         </div>
@@ -503,7 +506,7 @@ fn availability_line(a: &Anime, now: DateTime<Utc>) -> (&'static str, String) {
             format!(
                 "⏳ Episode {episode} airs {} · in {}",
                 browser::fmt_datetime(airing_at, true),
-                browser::fmt_countdown(in_seconds)
+                fmt_countdown(in_seconds)
             ),
         ),
         Availability::AllWatched => ("done", "✓ All episodes watched".into()),
@@ -573,7 +576,11 @@ fn Card(anime: Anime) -> impl IntoView {
         ))
     };
     let set_progress = move |ev| {
-        let v = event_target_value(&ev).parse::<u32>().unwrap_or(0);
+        // Ignore an empty or invalid field rather than resetting progress to 0.
+        let Ok(v) = event_target_value(&ev).trim().parse::<u32>() else {
+            ctx.error("Progress must be a whole number".into());
+            return;
+        };
         ctx.update_with(api::update_anime(
             id,
             UpdateReq {
@@ -615,17 +622,19 @@ fn Card(anime: Anime) -> impl IntoView {
             log_ep.get_untracked().parse::<u32>(),
             browser::parse_datetime_local(&log_at.get_untracked()),
         ) else {
-            ctx.error("Enter an episode number and a date".into());
+            ctx.error("Enter an episode number and a valid date".into());
             return;
         };
-        ctx.update_with(api::log_watch(
-            id,
-            WatchReq {
-                episode: Some(episode),
-                watched_at: Some(at),
-            },
-        ));
-        ctx.toast(format!("Logged episode {episode}"), false);
+        ctx.update_with_message(
+            api::log_watch(
+                id,
+                WatchReq {
+                    episode: Some(episode),
+                    watched_at: Some(at),
+                },
+            ),
+            Some(format!("Logged episode {episode}")),
+        );
     };
     let log_open = ctx.open_logs.with_untracked(|s| s.contains(&id));
     let toggle_log = move |_| {

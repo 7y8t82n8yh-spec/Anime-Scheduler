@@ -6,6 +6,11 @@ use serde::{de::DeserializeOwned, Serialize};
 
 pub type ApiResult<T> = Result<T, String>;
 
+/// The server rejects state-changing requests without this header (CSRF protection).
+fn with_csrf(req: RequestBuilder) -> RequestBuilder {
+    req.header(CSRF_HEADER, CSRF_HEADER_VALUE)
+}
+
 async fn check(resp: Result<Response, gloo_net::Error>) -> ApiResult<Response> {
     let resp = resp.map_err(|e| format!("network error: {e}"))?;
     if resp.ok() {
@@ -19,6 +24,7 @@ async fn check(resp: Result<Response, gloo_net::Error>) -> ApiResult<Response> {
 }
 
 async fn json<T: DeserializeOwned>(req: RequestBuilder) -> ApiResult<T> {
+    let req = with_csrf(req);
     check(req.send().await)
         .await?
         .json()
@@ -30,7 +36,7 @@ async fn json_body<B: Serialize, T: DeserializeOwned>(
     req: RequestBuilder,
     body: &B,
 ) -> ApiResult<T> {
-    let req = req.json(body).map_err(|e| e.to_string())?;
+    let req = with_csrf(req).json(body).map_err(|e| e.to_string())?;
     check(req.send().await)
         .await?
         .json()
@@ -39,11 +45,12 @@ async fn json_body<B: Serialize, T: DeserializeOwned>(
 }
 
 async fn empty(req: RequestBuilder) -> ApiResult<()> {
+    let req = with_csrf(req);
     check(req.send().await).await.map(|_| ())
 }
 
 async fn empty_body<B: Serialize>(req: RequestBuilder, body: &B) -> ApiResult<()> {
-    let req = req.json(body).map_err(|e| e.to_string())?;
+    let req = with_csrf(req).json(body).map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
 }
 

@@ -90,7 +90,7 @@ pub struct MalTokens {
 }
 
 /// Everything that gets persisted to disk.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Data {
     #[serde(default)]
     pub anime: BTreeMap<i64, Anime>,
@@ -110,6 +110,14 @@ impl Data {
             return;
         };
         if !a.status.is_active() {
+            return;
+        }
+        // Skip episodes already marked watched (e.g. seen elsewhere before AniList updated).
+        let eps = NewEpisodes {
+            from: eps.from.max(a.watched + 1),
+            to: eps.to,
+        };
+        if eps.from > eps.to {
             return;
         }
         let message = if eps.from == eps.to {
@@ -214,5 +222,22 @@ mod tests {
         d.notify_new_episodes(1, NewEpisodes { from: 2, to: 3 }, now);
         assert_eq!(d.notifications.len(), 1);
         assert_eq!(d.notifications[0].message, "Episodes 2–3 are out!");
+    }
+
+    #[test]
+    fn notifications_skip_watched_episodes() {
+        let now = Utc::now();
+        let mut d = Data::default();
+        let mut a = Anime::from_media(
+            &media("RELEASING", None, Some((2, 0))),
+            WatchStatus::Watching,
+            now,
+        );
+        a.watched = 3;
+        d.anime.insert(1, a);
+        d.notify_new_episodes(1, NewEpisodes { from: 2, to: 3 }, now);
+        assert!(d.notifications.is_empty());
+        d.notify_new_episodes(1, NewEpisodes { from: 2, to: 5 }, now);
+        assert_eq!(d.notifications[0].message, "Episodes 4–5 are out!");
     }
 }

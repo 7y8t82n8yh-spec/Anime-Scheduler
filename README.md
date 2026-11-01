@@ -28,12 +28,16 @@ because MAL's API has no per-episode air schedule. Shows are matched between the
 
 ## Running
 
-One-time setup:
+One-time setup (Rust 1.82 or newer):
 
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install trunk --locked
 ```
+
+Trunk downloads `wasm-bindgen` and `wasm-opt` (which shrinks the `.wasm` to roughly a third)
+on first build. Offline, install them yourself with
+`cargo install wasm-bindgen-cli --version 0.2.130 --locked` and `cargo install wasm-opt --locked`.
 
 Build the frontend, then run the server (from the repository root):
 
@@ -45,7 +49,11 @@ cargo run --release                      # serves the app at http://127.0.0.1:30
 For frontend development with live reload, run the server and `trunk serve` in `frontend/`
 side by side, then open http://127.0.0.1:8080 (API calls are proxied to the server).
 
-Data is stored in `anime_data.json` in the working directory.
+Data is stored in `anime_data.json` in the working directory. The file contains your
+MyAnimeList login tokens, so it is created readable only by your user.
+
+The API rejects state-changing requests that don't carry an `X-Requested-With: anime-scheduler`
+header (the frontend sends it), which stops other websites from driving it via your browser.
 
 ### Configuration (environment variables)
 
@@ -54,7 +62,7 @@ Data is stored in `anime_data.json` in the working directory.
 | `BIND` | `127.0.0.1:3000` | Address to listen on |
 | `PUBLIC_URL` | `http://$BIND` | URL you open in the browser (used for the MAL OAuth redirect) |
 | `DATA_FILE` | `anime_data.json` | Where your list is saved |
-| `STATIC_DIR` | `frontend/dist` | Built WebAssembly frontend to serve |
+| `STATIC_DIR` | `frontend/dist` (falls back to the checkout's) | Built WebAssembly frontend to serve |
 | `POLL_MINUTES` | `30` | Max time between airing checks |
 | `MAL_CLIENT_ID` | – | Turns on MyAnimeList import/sync |
 | `MAL_CLIENT_SECRET` | – | Only for MAL clients of type "web" |

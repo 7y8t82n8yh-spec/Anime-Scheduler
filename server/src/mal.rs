@@ -182,15 +182,9 @@ impl Mal {
     /// Fetch a user's anime list. `user` is a username or `@me` (requires a token).
     /// Public lists can be read with just the client id.
     pub async fn user_list(&self, user: &str, token: Option<&str>) -> Result<Vec<MalListEntry>> {
-        let mut url = reqwest::Url::parse_with_params(
-            &format!("{}/v2/users/{}/animelist", self.api_base, user),
-            &[
-                ("fields", "list_status"),
-                ("limit", "1000"),
-                ("nsfw", "true"),
-            ],
-        )?
-        .to_string();
+        let first = self.list_url(user)?;
+        let origin = first.origin();
+        let mut url = first.to_string();
         let mut out = Vec::new();
         for _ in 0..50 {
             let resp = self
@@ -217,11 +211,67 @@ impl Mal {
                 }
             }));
             match page.paging.and_then(|p| p.next) {
-                Some(next) => url = next,
+                // Only follow pagination links back to the MAL API (they carry our token).
+                Some(next) if reqwest::Url::parse(&next).is_ok_and(|u| u.origin() == origin) => {
+                    url = next;
+                }
+                Some(next) => {
+                    bail!("refusing to follow MAL pagination link to another host: {next}")
+                }
                 None => break,
             }
         }
         Ok(out)
+    }
+
+    /// `{api_base}/v2/users/{user}/animelist?...` with `user` encoded as a single path
+    /// segment, so names containing `/`, `?`, `#` or `..` can't change the request.
+    pub fn list_url(&self, user: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.api_base)?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("invalid MAL API base URL"))?
+            .pop_if_empty()
+            .extend(["v2", "users", user, "animelist"]);
+        url.query_pairs_mut()
+            .append_pair("fields", "list_status")
+            .append_pair("limit", "1000")
+            .append_pair("nsfw", "true");
+        Ok(url)
+    }
+
+    /// The signed-in user's list entry for one anime, if it is on their list.
+    pub async fn my_list_status(
+        &self,
+        token: &str,
+        mal_id: i64,
+    ) -> Result<Option<(Option<WatchStatus>, u32)>> {
+        #[derive(Deserialize)]
+        struct AnimeDetails {
+            my_list_status: Option<ListStatus>,
+        }
+        let resp = self
+            .http
+            .get(format!(
+                "{}/v2/anime/{mal_id}?fields=my_list_status",
+                self.api_base
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("MAL request failed")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            bail!("MAL anime lookup failed (HTTP {})", resp.status());
+        }
+        let details: AnimeDetails = resp.json().await.context("invalid MAL anime response")?;
+        Ok(details.my_list_status.map(|s| {
+            (
+                s.status.as_deref().and_then(WatchStatus::from_mal),
+                s.num_episodes_watched.unwrap_or(0),
+            )
+        }))
     }
 
     pub async fn update_progress(
@@ -251,5 +301,32 @@ impl Mal {
             bail!("MAL update failed (HTTP {status}): {body}");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn username_is_one_path_segment() {
+        let mal = Mal::new(
+            reqwest::Client::new(),
+            "id".into(),
+            None,
+            "https://api.myanimelist.net".into(),
+            "https://myanimelist.net".into(),
+        );
+        let url = mal.list_url("../anime/1/my_list_status#x?y").unwrap();
+        assert_eq!(url.host_str(), Some("api.myanimelist.net"));
+        assert_eq!(
+            url.path(),
+            "/v2/users/..%2Fanime%2F1%2Fmy_list_status%23x%3Fy/animelist"
+        );
+        assert!(url.query().unwrap().contains("limit=1000"));
+        assert_eq!(
+            mal.list_url("@me").unwrap().path(),
+            "/v2/users/@me/animelist"
+        );
     }
 }

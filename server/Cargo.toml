@@ -4,6 +4,7 @@ description = "Self-hosted web app to track the anime you want to watch, what's 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 anime-shared.workspace = true

@@ -39,19 +39,6 @@ pub fn fmt_date(d: NaiveDate) -> String {
     }
 }
 
-/// "2d 3h", "4h 10m", "12m".
-pub fn fmt_countdown(seconds: i64) -> String {
-    let s = seconds.max(0);
-    let (d, h, m) = (s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60);
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else {
-        format!("{m}m")
-    }
-}
-
 /// Current local time in `<input type="datetime-local">` format.
 pub fn datetime_local_now() -> String {
     Local::now().format("%Y-%m-%dT%H:%M").to_string()
@@ -60,9 +47,16 @@ pub fn datetime_local_now() -> String {
 /// Parse an `<input type="datetime-local">` value as local time.
 pub fn parse_datetime_local(v: &str) -> Option<DateTime<Utc>> {
     let naive = NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M").ok()?;
+    // Ambiguous (DST fall-back) -> earlier instant; nonexistent (spring-forward gap) ->
+    // the same wall-clock time an hour later, which is what clocks showed.
     Local
         .from_local_datetime(&naive)
         .earliest()
+        .or_else(|| {
+            Local
+                .from_local_datetime(&(naive + chrono::Duration::hours(1)))
+                .earliest()
+        })
         .map(|d| d.with_timezone(&Utc))
 }
 

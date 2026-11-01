@@ -80,7 +80,7 @@ impl WatchStatus {
 }
 
 /// Airing information as last fetched from AniList.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AiringInfo {
     /// AniList media status: FINISHED, RELEASING, NOT_YET_RELEASED, CANCELLED, HIATUS.
     pub media_status: Option<String>,
@@ -95,13 +95,13 @@ pub struct AiringInfo {
     pub fetched_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WatchEvent {
     pub episode: u32,
     pub watched_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Anime {
     pub anilist_id: i64,
     pub mal_id: Option<i64>,
@@ -121,9 +121,17 @@ pub struct Anime {
 
 impl Anime {
     /// Record that `episode` was watched at `at`. Progress becomes at least `episode`.
-    pub fn log_watch(&mut self, episode: u32, at: DateTime<Utc>) {
+    ///
+    /// # Errors
+    /// Returns an error for episode 0 or an episode beyond the known total.
+    pub fn log_watch(&mut self, episode: u32, at: DateTime<Utc>) -> Result<(), String> {
         if episode == 0 {
-            return;
+            return Err("episode numbers start at 1".into());
+        }
+        if let Some(total) = self.airing.total_episodes.filter(|t| *t > 0) {
+            if episode > total {
+                return Err(format!("this anime only has {total} episodes"));
+            }
         }
         if let Some(e) = self.watch_log.iter_mut().find(|e| e.episode == episode) {
             e.watched_at = at;
@@ -138,15 +146,13 @@ impl Anime {
         }
         self.watch_log.sort_by_key(|e| e.episode);
         self.after_progress_change();
+        Ok(())
     }
 
     /// Set progress directly. Log entries above the new progress are dropped; newly
     /// covered episodes get logged as watched at `at`.
     pub fn set_progress(&mut self, watched: u32, at: DateTime<Utc>) {
-        let watched = match self.airing.total_episodes {
-            Some(t) if t > 0 => watched.min(t),
-            _ => watched,
-        };
+        let watched = self.clamp_to_total(watched);
         self.watch_log.retain(|e| e.episode <= watched);
         for ep in (self.watched + 1)..=watched {
             self.watch_log.push(WatchEvent {
@@ -159,13 +165,45 @@ impl Anime {
         self.after_progress_change();
     }
 
+    /// Merge progress imported from MyAnimeList. MAL's status wins, but progress never
+    /// goes backwards (local progress may be ahead if earlier syncs failed), and no
+    /// watch timestamps are invented.
+    pub fn import_progress(&mut self, watched: u32, status: WatchStatus) {
+        self.status = status;
+        let watched = self.clamp_to_total(self.watched.max(watched));
+        self.watch_log.retain(|e| e.episode <= watched);
+        self.watched = watched;
+        self.after_progress_change();
+    }
+
+    fn clamp_to_total(&self, watched: u32) -> u32 {
+        match self.airing.total_episodes {
+            Some(t) if t > 0 => watched.min(t),
+            _ => watched,
+        }
+    }
+
+    /// Hash of everything a card displays (excludes `fetched_at`, which changes on every
+    /// refresh). Used by the frontend to decide when a card must re-render.
+    pub fn display_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut copy = self.clone();
+        copy.airing.fetched_at = None;
+        copy.hash(&mut h);
+        h.finish()
+    }
+
     fn after_progress_change(&mut self) {
         if self.watched > 0 && self.status == WatchStatus::Planning {
             self.status = WatchStatus::Watching;
         }
-        if let Some(total) = self.airing.total_episodes {
-            if total > 0 && self.watched >= total && self.status != WatchStatus::Dropped {
+        if let Some(total) = self.airing.total_episodes.filter(|t| *t > 0) {
+            if self.watched >= total && self.status != WatchStatus::Dropped {
                 self.status = WatchStatus::Completed;
+            } else if self.watched < total && self.status == WatchStatus::Completed {
+                // e.g. undoing the last episode
+                self.status = WatchStatus::Watching;
             }
         }
     }
@@ -241,20 +279,60 @@ impl Availability {
 }
 
 /// Work out the highest aired episode from AniList data, falling back to what we knew.
+///
+/// Never goes below `prev` for a show that has started, so stale data (e.g. from a
+/// slow concurrent fetch) can't make an episode "un-air" and be announced twice.
 pub fn latest_aired(
     status: Option<&str>,
     total: Option<u32>,
     next_episode: Option<u32>,
     prev: u32,
 ) -> u32 {
+    if status == Some("NOT_YET_RELEASED") {
+        return next_episode.map_or(0, |n| n.saturating_sub(1));
+    }
     if let Some(next) = next_episode {
-        return next.saturating_sub(1);
+        return next.saturating_sub(1).max(prev);
     }
     match status {
         Some("FINISHED") => total.unwrap_or(prev).max(prev),
         Some("NOT_YET_RELEASED") => 0,
         _ => prev,
     }
+}
+
+/// "2d 3h", "4h 10m", "12m".
+pub fn fmt_countdown(seconds: i64) -> String {
+    let s = seconds.max(0);
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// Which notifications should pop up as desktop alerts.
+///
+/// `last_alerted` is the stored high-water mark: `None` on the very first visit (alert
+/// nothing, just remember where we are), `Some(-1)` once visited with no notifications.
+/// Returns the alerts (oldest first) and the high-water mark to store next.
+pub fn pending_alerts(
+    list: &[Notification],
+    last_alerted: Option<i64>,
+) -> (Vec<&Notification>, i64) {
+    let max_id = list.iter().map(|n| n.id as i64).max().unwrap_or(-1);
+    let Some(prev) = last_alerted else {
+        return (vec![], max_id);
+    };
+    let mut alerts: Vec<_> = list
+        .iter()
+        .filter(|n| !n.read && n.id as i64 > prev)
+        .collect();
+    alerts.sort_by_key(|n| n.id);
+    (alerts, prev.max(max_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -271,6 +349,12 @@ pub struct Notification {
 // ---------------------------------------------------------------------------
 // HTTP API payloads
 // ---------------------------------------------------------------------------
+
+/// Header every state-changing API request must carry. Browsers won't send a custom
+/// header cross-origin without a CORS preflight (which the server never approves), so
+/// this blocks other websites from driving the API (CSRF).
+pub const CSRF_HEADER: &str = "x-requested-with";
+pub const CSRF_HEADER_VALUE: &str = "anime-scheduler";
 
 /// An anime as returned by the API, with its availability at response time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -453,7 +537,9 @@ mod tests {
     fn progress_and_log() {
         let now = Utc::now();
         let mut a = anime("FINISHED", Some(3), 3, None);
-        a.log_watch(1, now);
+        a.log_watch(1, now).unwrap();
+        assert!(a.log_watch(4, now).is_err(), "beyond total");
+        assert!(a.log_watch(0, now).is_err());
         assert_eq!(a.watched, 1);
         assert_eq!(a.status, WatchStatus::Watching);
         a.set_progress(10, now);
@@ -492,5 +578,82 @@ mod tests {
         assert_eq!(json["anilist_id"], 1, "anime fields are flattened");
         let back: AnimeView = serde_json::from_value(json).unwrap();
         assert_eq!(back, v);
+    }
+
+    #[test]
+    fn latest_aired_is_monotonic() {
+        // Stale data saying episode 5 is next must not undo episode 5 having aired.
+        assert_eq!(latest_aired(Some("RELEASING"), None, Some(5), 5), 5);
+        assert_eq!(latest_aired(Some("RELEASING"), None, Some(7), 5), 6);
+    }
+
+    #[test]
+    fn undo_last_episode_uncompletes() {
+        let now = Utc::now();
+        let mut a = anime("FINISHED", Some(3), 3, None);
+        a.set_progress(3, now);
+        assert_eq!(a.status, WatchStatus::Completed);
+        a.set_progress(2, now);
+        assert_eq!(a.status, WatchStatus::Watching);
+    }
+
+    #[test]
+    fn import_never_goes_backwards() {
+        let now = Utc::now();
+        let mut a = anime("FINISHED", Some(12), 12, None);
+        a.set_progress(5, now);
+        a.import_progress(3, WatchStatus::Paused);
+        assert_eq!((a.watched, a.status), (5, WatchStatus::Paused));
+        a.import_progress(99, WatchStatus::Watching);
+        assert_eq!(a.watched, 12, "clamped");
+        assert_eq!(a.status, WatchStatus::Completed, "auto-completes");
+        assert_eq!(a.watch_log.len(), 5, "no invented timestamps");
+    }
+
+    #[test]
+    fn display_hash_ignores_fetch_time() {
+        let mut a = anime("RELEASING", Some(12), 4, None);
+        let h = a.display_hash();
+        a.airing.fetched_at = Some(Utc::now() + chrono::Duration::hours(1));
+        assert_eq!(a.display_hash(), h);
+        a.watched = 1;
+        assert_ne!(a.display_hash(), h);
+    }
+
+    #[test]
+    fn countdown_format() {
+        assert_eq!(fmt_countdown(-5), "0m");
+        assert_eq!(fmt_countdown(59), "0m");
+        assert_eq!(fmt_countdown(3_660), "1h 1m");
+        assert_eq!(fmt_countdown(2 * 86_400 + 3 * 3600 + 59), "2d 3h");
+    }
+
+    #[test]
+    fn alert_high_water_mark() {
+        let n = |id, read| Notification {
+            id,
+            anilist_id: 1,
+            title: String::new(),
+            message: String::new(),
+            cover: None,
+            created_at: Utc::now(),
+            read,
+        };
+        // First visit: remember, don't alert.
+        let (alerts, hw) = pending_alerts(&[], None);
+        assert!(alerts.is_empty());
+        assert_eq!(hw, -1);
+        // Notification id 0 arrives later: alert it.
+        let list = [n(0, false)];
+        let (alerts, hw) = pending_alerts(&list, Some(hw));
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(hw, 0);
+        // Newest-first input, one already read: alerts come out oldest first, unread only.
+        let list = [n(3, false), n(2, true), n(1, false), n(0, false)];
+        let (alerts, hw) = pending_alerts(&list, Some(0));
+        assert_eq!(alerts.iter().map(|a| a.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(hw, 3);
+        // Cleared list doesn't lower the mark.
+        assert_eq!(pending_alerts(&[], Some(3)).1, 3);
     }
 }

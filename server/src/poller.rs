@@ -1,13 +1,20 @@
 //! Background refresh of airing data and creation of new-episode notifications.
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::time::Duration;
 
 use crate::{model::FromMedia, SharedState};
 
 /// Re-fetch airing info for every tracked anime. Returns the number of notifications created.
+///
+/// Runs are serialised, so the poller and the Refresh button can't interleave and apply
+/// stale results over fresh ones.
+///
+/// # Errors
+/// Fails if AniList can't be reached or the data file can't be written.
 pub async fn refresh_all(state: &SharedState) -> Result<usize> {
+    let _guard = state.refresh_lock.lock().await;
     let ids: Vec<i64> = state.store.read().await.anime.keys().copied().collect();
     if ids.is_empty() {
         return Ok(0);
@@ -34,11 +41,38 @@ pub async fn refresh_all(state: &SharedState) -> Result<usize> {
         .await
 }
 
-/// How long to sleep: the poll interval, or until just after the next episode airs if sooner.
-async fn next_delay(state: &SharedState) -> Duration {
-    let max = Duration::from_secs(state.config.poll_minutes * 60);
-    let now = Utc::now();
-    let soonest = state
+/// How long to sleep before the next refresh.
+///
+/// Normally the poll interval, or until just after the next known air time if that's
+/// sooner (AniList updates at air time; we give it two minutes). Air times more than an
+/// hour old are ignored so a show AniList stopped updating can't make us poll every
+/// minute forever. After `failures` consecutive errors we back off exponentially.
+pub fn compute_delay(
+    now: DateTime<Utc>,
+    airing_times: impl IntoIterator<Item = DateTime<Utc>>,
+    max: Duration,
+    failures: u32,
+) -> Duration {
+    let soonest = airing_times
+        .into_iter()
+        .filter(|t| *t > now - chrono::Duration::hours(1))
+        .min();
+    let mut delay = match soonest {
+        Some(t) => {
+            let secs = ((t - now).num_seconds() + 120).max(60);
+            Duration::from_secs(secs.unsigned_abs()).min(max)
+        }
+        None => max,
+    };
+    if failures > 0 {
+        let backoff = Duration::from_secs(60u64 << failures.min(6)).min(max);
+        delay = delay.max(backoff);
+    }
+    delay
+}
+
+async fn next_delay(state: &SharedState, failures: u32) -> Duration {
+    let times: Vec<_> = state
         .store
         .read()
         .await
@@ -46,31 +80,79 @@ async fn next_delay(state: &SharedState) -> Duration {
         .values()
         .filter(|a| a.status.is_active())
         .filter_map(|a| a.airing.next_airing_at)
-        .min();
-    match soonest {
-        // AniList usually updates right at air time; give it a couple of minutes.
-        Some(t) => {
-            let secs = (t - now).num_seconds() + 120;
-            Duration::from_secs(secs.max(60) as u64).min(max)
-        }
-        None => max,
-    }
+        .collect();
+    compute_delay(
+        Utc::now(),
+        times,
+        Duration::from_secs(state.config.poll_minutes * 60),
+        failures,
+    )
 }
 
 pub fn spawn(state: SharedState) {
     tokio::spawn(async move {
+        let mut failures = 0u32;
         loop {
             match refresh_all(&state).await {
-                Ok(0) => tracing::debug!("refresh done"),
-                Ok(n) => tracing::info!("refresh done, {n} new notification(s)"),
-                Err(e) => tracing::warn!("refresh failed: {e:#}"),
+                Ok(n) => {
+                    failures = 0;
+                    if n > 0 {
+                        tracing::info!("refresh done, {n} new notification(s)");
+                    }
+                }
+                Err(e) => {
+                    failures = failures.saturating_add(1);
+                    tracing::warn!("refresh failed ({failures} in a row): {e:#}");
+                }
             }
-            let delay = next_delay(&state).await;
-            tracing::debug!("next refresh in {}s", delay.as_secs());
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = state.refresh_now.notified() => {}
+            // Sleep until the next refresh is due. A reschedule (after a manual refresh
+            // or a newly added show) recomputes the wake-up time without refreshing.
+            loop {
+                let delay = next_delay(&state, failures).await;
+                tracing::debug!("next refresh in {}s", delay.as_secs());
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => break,
+                    () = state.reschedule.notified() => {}
+                }
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX: Duration = Duration::from_secs(30 * 60);
+
+    #[test]
+    fn delay_rules() {
+        let now = Utc::now();
+        let mins = |m: i64| now + chrono::Duration::minutes(m);
+        assert_eq!(compute_delay(now, [], MAX, 0), MAX);
+        // Episode in 10 min -> wake 2 min after it airs.
+        assert_eq!(
+            compute_delay(now, [mins(10), mins(20)], MAX, 0),
+            Duration::from_secs(12 * 60)
+        );
+        // Far future -> capped at the poll interval.
+        assert_eq!(compute_delay(now, [mins(600)], MAX, 0), MAX);
+        // Just aired / slightly overdue -> at least a minute.
+        assert_eq!(
+            compute_delay(now, [mins(-30)], MAX, 0),
+            Duration::from_secs(60)
+        );
+        // Long overdue (AniList stopped updating) -> ignored.
+        assert_eq!(compute_delay(now, [mins(-90)], MAX, 0), MAX);
+        // Errors back off: 2, 4, 8 ... minutes, capped.
+        assert_eq!(
+            compute_delay(now, [mins(-30)], MAX, 1),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            compute_delay(now, [mins(-30)], MAX, 3),
+            Duration::from_secs(480)
+        );
+        assert_eq!(compute_delay(now, [mins(-30)], MAX, 20), MAX);
+    }
 }
