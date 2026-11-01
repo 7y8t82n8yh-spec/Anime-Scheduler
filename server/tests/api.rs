@@ -426,9 +426,17 @@ async fn csrf_guard() {
 
 #[tokio::test]
 async fn expired_token_is_refreshed_once() {
-    let env = setup("2000-01-01T00:00:00Z").await;
+    let env = setup("2099-01-01T00:00:00Z").await;
     env.post("/api/anime", json!({ "anilist_id": 1 })).await;
     env.post("/api/anime", json!({ "anilist_id": 2 })).await;
+    // Expire the token only now, so the concurrent requests below are the first to need
+    // a refresh.
+    env.state
+        .store
+        .mutate(|d| d.mal.as_mut().unwrap().expires_at = chrono::DateTime::UNIX_EPOCH)
+        .await
+        .unwrap();
+    assert_eq!(env.mock.lock().unwrap().token_calls, 0);
     // Concurrent syncs that both need a token -> exactly one refresh.
     let (a, b) = tokio::join!(
         env.post("/api/anime/1/watch", json!({})),
@@ -444,6 +452,8 @@ async fn expired_token_is_refreshed_once() {
     assert_eq!(stored.refresh_token, "r2");
 }
 
+/// Behavioural test: however two refreshes interleave (serialised by `refresh_lock`,
+/// and `latest_aired` is monotonic), an episode is announced exactly once.
 #[tokio::test]
 async fn concurrent_refreshes_notify_once() {
     let env = setup("2099-01-01T00:00:00Z").await;
@@ -491,4 +501,46 @@ async fn oauth_callback_errors() {
         .unwrap();
     let body = r.text().await.unwrap();
     assert!(!body.contains("<script>"), "{body}");
+}
+
+#[tokio::test]
+async fn adding_respects_chosen_status_when_mal_has_no_progress() {
+    let env = setup("2099-01-01T00:00:00Z").await;
+    env.mock
+        .lock()
+        .unwrap()
+        .mal_list
+        .insert(20, ("plan_to_watch", 0));
+    let res = env
+        .post(
+            "/api/anime",
+            json!({ "anilist_id": 2, "status": "watching" }),
+        )
+        .await;
+    assert_eq!(res["anime"]["status"], "watching");
+    let m = env.mock.lock().unwrap();
+    let (id, form) = m.mal_updates.last().expect("choice pushed to MAL");
+    assert_eq!((*id, form["status"].as_str()), (20, "watching"));
+}
+
+#[tokio::test]
+async fn bad_requests_get_json_errors() {
+    let env = setup("2099-01-01T00:00:00Z").await;
+    for (method, path, body) in [
+        (reqwest::Method::PATCH, "/api/anime/not-a-number", json!({})),
+        (
+            reqwest::Method::POST,
+            "/api/anime",
+            json!({ "wrong": true }),
+        ),
+    ] {
+        let (status, v) = env.send(method, path, body).await;
+        assert!(status.is_client_error(), "{path}: {status}");
+        assert!(v["error"].is_string(), "{path}: {v}");
+    }
+    let (status, v) = env
+        .send(reqwest::Method::DELETE, "/api/anime/99", json!({}))
+        .await;
+    assert_eq!(status, 404);
+    assert_eq!(v["error"], "anime not in your list");
 }

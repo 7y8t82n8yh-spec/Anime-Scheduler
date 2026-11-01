@@ -65,6 +65,20 @@ impl Store {
         tokio::fs::rename(&tmp, &self.path)
             .await
             .with_context(|| format!("cannot replace {}", self.path.display()))?;
+        // Make the rename itself durable across a power loss.
+        #[cfg(unix)]
+        if let Some(dir) = self.path.parent() {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            // The new file is already in place, so a failure here is only logged.
+            let synced = async { tokio::fs::File::open(dir).await?.sync_all().await }.await;
+            if let Err(e) = synced {
+                tracing::warn!("could not sync directory {}: {e}", dir.display());
+            }
+        }
         Ok(())
     }
 }

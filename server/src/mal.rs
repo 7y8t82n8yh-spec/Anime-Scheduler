@@ -66,14 +66,28 @@ struct User {
     name: String,
 }
 
+/// Turn an unsuccessful MAL response into an error. The response body goes to the log
+/// only; the returned message is safe to show to the user.
+async fn failure(resp: reqwest::Response, what: &str) -> anyhow::Error {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    tracing::warn!("{what} failed (HTTP {status}): {body}");
+    anyhow::anyhow!("{what} failed (HTTP {status})")
+}
+
+/// A random alphanumeric string of `len` characters (for OAuth state and PKCE).
+pub fn random_token(len: usize) -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
 /// A random PKCE code verifier (MAL only supports the `plain` challenge method,
 /// so the challenge is the verifier itself).
 pub fn new_code_verifier() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(96)
-        .map(char::from)
-        .collect()
+    random_token(96)
 }
 
 impl Mal {
@@ -121,9 +135,7 @@ impl Mal {
             .await
             .context("MAL token request failed")?;
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("MAL token request failed (HTTP {status}): {body}");
+            return Err(failure(resp, "MyAnimeList login refresh").await);
         }
         let t: TokenResponse = resp.json().await?;
         Ok(MalTokens {
@@ -193,9 +205,10 @@ impl Mal {
                 .await
                 .context("MAL request failed")?;
             if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                bail!("MAL list request failed (HTTP {status}): {body}");
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    bail!("MyAnimeList user not found, or their list is private");
+                }
+                return Err(failure(resp, "MyAnimeList list request").await);
             }
             let page: ListResponse = resp.json().await.context("invalid MAL list response")?;
             out.extend(page.data.into_iter().map(|i| {
@@ -296,9 +309,7 @@ impl Mal {
             .await
             .context("MAL update failed")?;
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("MAL update failed (HTTP {status}): {body}");
+            return Err(failure(resp, "MyAnimeList update").await);
         }
         Ok(())
     }

@@ -1,6 +1,6 @@
 //! Thin wrappers over browser APIs: local time formatting, localStorage, desktop notifications.
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, Timelike, Utc};
 use wasm_bindgen::JsValue;
 
 fn window() -> web_sys::Window {
@@ -33,8 +33,8 @@ pub fn fmt_datetime(dt: DateTime<Utc>, with_time: bool) -> String {
 /// Format a calendar date (no time zone shifting).
 pub fn fmt_date(d: NaiveDate) -> String {
     let noon = d.and_hms_opt(12, 0, 0).expect("valid time");
-    match Local.from_local_datetime(&noon).single() {
-        Some(local) => fmt_datetime(local.with_timezone(&Utc), false),
+    match local_to_utc(noon) {
+        Some(instant) => fmt_datetime(instant, false),
         None => d.to_string(),
     }
 }
@@ -47,17 +47,28 @@ pub fn datetime_local_now() -> String {
 /// Parse an `<input type="datetime-local">` value as local time.
 pub fn parse_datetime_local(v: &str) -> Option<DateTime<Utc>> {
     let naive = NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M").ok()?;
-    // Ambiguous (DST fall-back) -> earlier instant; nonexistent (spring-forward gap) ->
-    // the same wall-clock time an hour later, which is what clocks showed.
-    Local
-        .from_local_datetime(&naive)
-        .earliest()
-        .or_else(|| {
-            Local
-                .from_local_datetime(&(naive + chrono::Duration::hours(1)))
-                .earliest()
-        })
-        .map(|d| d.with_timezone(&Utc))
+    local_to_utc(naive)
+}
+
+/// Interpret a wall-clock time in the browser's time zone.
+///
+/// Uses JavaScript's `Date` (chrono's `Local` can't see DST transitions on wasm32).
+/// Per the ECMAScript spec, a time skipped by a DST jump resolves to the later
+/// offset and a repeated time to the earlier one.
+fn local_to_utc(t: NaiveDateTime) -> Option<DateTime<Utc>> {
+    let date = js_sys::Date::new_with_year_month_day_hr_min(
+        u32::try_from(t.year()).ok()?,
+        i32::try_from(t.month0()).ok()?,
+        i32::try_from(t.day()).ok()?,
+        i32::try_from(t.hour()).ok()?,
+        i32::try_from(t.minute()).ok()?,
+    );
+    let millis = date.get_time();
+    if millis.is_nan() {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)] // whole milliseconds within i64 range
+    DateTime::from_timestamp_millis(millis as i64)
 }
 
 // ---------- storage / page ----------

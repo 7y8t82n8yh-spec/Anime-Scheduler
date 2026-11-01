@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 anime-shared.workspace = true
 chrono = { workspace = true, features = ["wasmbind"] }

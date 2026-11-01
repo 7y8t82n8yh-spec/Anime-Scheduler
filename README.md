@@ -95,6 +95,8 @@ You can also import any *public* list by username without connecting, but progre
 
 ## Development
 
+The workspace forbids `unsafe` code (`[workspace.lints.rust] unsafe_code = "forbid"`).
+
 ```sh
 cargo test                                                   # shared + server tests (incl. end-to-end against mock AniList/MAL)
 cargo clippy -p anime-frontend --target wasm32-unknown-unknown   # check the frontend

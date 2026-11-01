@@ -6,10 +6,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 anime-shared.workspace = true
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
 chrono.workspace = true
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

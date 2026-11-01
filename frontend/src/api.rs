@@ -6,8 +6,24 @@ use serde::{de::DeserializeOwned, Serialize};
 
 pub type ApiResult<T> = Result<T, String>;
 
+/// Send a request (without a body) and fail on non-2xx responses.
+async fn send(req: RequestBuilder) -> ApiResult<Response> {
+    check(csrf(req).send().await).await
+}
+
+/// Send a request with a JSON body and fail on non-2xx responses.
+async fn send_json(req: RequestBuilder, body: &impl Serialize) -> ApiResult<Response> {
+    let req = csrf(req).json(body).map_err(|e| e.to_string())?;
+    check(req.send().await).await
+}
+
+/// Decode a JSON response body.
+async fn read<T: DeserializeOwned>(resp: Response) -> ApiResult<T> {
+    resp.json().await.map_err(|e| format!("bad response: {e}"))
+}
+
 /// The server rejects state-changing requests without this header (CSRF protection).
-fn with_csrf(req: RequestBuilder) -> RequestBuilder {
+fn csrf(req: RequestBuilder) -> RequestBuilder {
     req.header(CSRF_HEADER, CSRF_HEADER_VALUE)
 }
 
@@ -23,90 +39,63 @@ async fn check(resp: Result<Response, gloo_net::Error>) -> ApiResult<Response> {
     })
 }
 
-async fn json<T: DeserializeOwned>(req: RequestBuilder) -> ApiResult<T> {
-    let req = with_csrf(req);
-    check(req.send().await)
-        .await?
-        .json()
-        .await
-        .map_err(|e| format!("bad response: {e}"))
-}
-
-async fn json_body<B: Serialize, T: DeserializeOwned>(
-    req: RequestBuilder,
-    body: &B,
-) -> ApiResult<T> {
-    let req = with_csrf(req).json(body).map_err(|e| e.to_string())?;
-    check(req.send().await)
-        .await?
-        .json()
-        .await
-        .map_err(|e| format!("bad response: {e}"))
-}
-
-async fn empty(req: RequestBuilder) -> ApiResult<()> {
-    let req = with_csrf(req);
-    check(req.send().await).await.map(|_| ())
-}
-
-async fn empty_body<B: Serialize>(req: RequestBuilder, body: &B) -> ApiResult<()> {
-    let req = with_csrf(req).json(body).map_err(|e| e.to_string())?;
-    check(req.send().await).await.map(|_| ())
-}
-
 pub async fn list_anime() -> ApiResult<Vec<AnimeView>> {
-    json(Request::get("/api/anime")).await
+    read(send(Request::get("/api/anime")).await?).await
 }
 
 pub async fn add_anime(anilist_id: i64, status: WatchStatus) -> ApiResult<UpdateResp> {
-    json_body(Request::post("/api/anime"), &AddReq { anilist_id, status }).await
+    let body = AddReq { anilist_id, status };
+    read(send_json(Request::post("/api/anime"), &body).await?).await
 }
 
 pub async fn update_anime(id: i64, req: UpdateReq) -> ApiResult<UpdateResp> {
-    json_body(Request::patch(&format!("/api/anime/{id}")), &req).await
+    read(send_json(Request::patch(&format!("/api/anime/{id}")), &req).await?).await
 }
 
 pub async fn log_watch(id: i64, req: WatchReq) -> ApiResult<UpdateResp> {
-    json_body(Request::post(&format!("/api/anime/{id}/watch")), &req).await
+    read(send_json(Request::post(&format!("/api/anime/{id}/watch")), &req).await?).await
 }
 
 pub async fn remove_anime(id: i64) -> ApiResult<()> {
-    empty(Request::delete(&format!("/api/anime/{id}"))).await
+    send(Request::delete(&format!("/api/anime/{id}")))
+        .await
+        .map(drop)
 }
 
 pub async fn search(q: &str) -> ApiResult<Vec<SearchResult>> {
     let q = String::from(js_sys::encode_uri_component(q));
-    json(Request::get(&format!("/api/search?q={q}"))).await
+    read(send(Request::get(&format!("/api/search?q={q}"))).await?).await
 }
 
 pub async fn refresh() -> ApiResult<RefreshResp> {
-    json(Request::post("/api/refresh")).await
+    read(send(Request::post("/api/refresh")).await?).await
 }
 
 pub async fn notifications() -> ApiResult<NotificationsResp> {
-    json(Request::get("/api/notifications")).await
+    read(send(Request::get("/api/notifications")).await?).await
 }
 
 pub async fn mark_all_read() -> ApiResult<()> {
-    empty_body(
+    send_json(
         Request::post("/api/notifications/read"),
         &ReadReq::default(),
     )
     .await
+    .map(drop)
 }
 
 pub async fn clear_notifications() -> ApiResult<()> {
-    empty(Request::delete("/api/notifications")).await
+    send(Request::delete("/api/notifications")).await.map(drop)
 }
 
 pub async fn mal_status() -> ApiResult<MalStatus> {
-    json(Request::get("/api/mal")).await
+    read(send(Request::get("/api/mal")).await?).await
 }
 
 pub async fn mal_import(req: ImportReq) -> ApiResult<ImportResp> {
-    json_body(Request::post("/api/mal/import"), &req).await
+    read(send_json(Request::post("/api/mal/import"), &req).await?).await
 }
 
 pub async fn mal_disconnect() -> ApiResult<()> {
-    empty(Request::post("/api/mal/disconnect")).await
+    send(Request::post("/api/mal/disconnect")).await.map(drop)
 }

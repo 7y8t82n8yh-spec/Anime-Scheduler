@@ -165,11 +165,15 @@ impl Anime {
         self.after_progress_change();
     }
 
-    /// Merge progress imported from MyAnimeList. MAL's status wins, but progress never
-    /// goes backwards (local progress may be ahead if earlier syncs failed), and no
-    /// watch timestamps are invented.
+    /// Merge progress imported from MyAnimeList without inventing watch timestamps.
+    ///
+    /// Progress never goes backwards: local progress may be ahead if earlier syncs to
+    /// MAL failed. MAL's status is adopted only when MAL is at least as far along as we
+    /// are; otherwise our (newer) local status is kept.
     pub fn import_progress(&mut self, watched: u32, status: WatchStatus) {
-        self.status = status;
+        if watched >= self.watched {
+            self.status = status;
+        }
         let watched = self.clamp_to_total(self.watched.max(watched));
         self.watch_log.retain(|e| e.episode <= watched);
         self.watched = watched;
@@ -187,10 +191,56 @@ impl Anime {
     /// refresh). Used by the frontend to decide when a card must re-render.
     pub fn display_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
+        // Destructured so a newly added field can't be forgotten here.
+        let Anime {
+            anilist_id,
+            mal_id,
+            title,
+            title_english,
+            cover,
+            site_url,
+            status,
+            watched,
+            watch_log,
+            airing,
+            added_at,
+        } = self;
+        let AiringInfo {
+            media_status,
+            total_episodes,
+            latest_aired,
+            next_episode,
+            next_airing_at,
+            start_date,
+            format,
+            season,
+            fetched_at: _,
+        } = airing;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        let mut copy = self.clone();
-        copy.airing.fetched_at = None;
-        copy.hash(&mut h);
+        (
+            anilist_id,
+            mal_id,
+            title,
+            title_english,
+            cover,
+            site_url,
+            status,
+            watched,
+            watch_log,
+            added_at,
+        )
+            .hash(&mut h);
+        (
+            media_status,
+            total_episodes,
+            latest_aired,
+            next_episode,
+            next_airing_at,
+            start_date,
+            format,
+            season,
+        )
+            .hash(&mut h);
         h.finish()
     }
 
@@ -602,7 +652,11 @@ mod tests {
         let now = Utc::now();
         let mut a = anime("FINISHED", Some(12), 12, None);
         a.set_progress(5, now);
+        // MAL is behind (e.g. earlier syncs failed): keep our progress and status.
         a.import_progress(3, WatchStatus::Paused);
+        assert_eq!((a.watched, a.status), (5, WatchStatus::Watching));
+        // MAL caught up: its status wins.
+        a.import_progress(5, WatchStatus::Paused);
         assert_eq!((a.watched, a.status), (5, WatchStatus::Paused));
         a.import_progress(99, WatchStatus::Watching);
         assert_eq!(a.watched, 12, "clamped");

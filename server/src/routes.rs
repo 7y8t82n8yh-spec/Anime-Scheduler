@@ -1,7 +1,10 @@
 //! HTTP API and static frontend.
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{
+        rejection::{JsonRejection, PathRejection, QueryRejection},
+        FromRequest, FromRequestParts, Query, Request, State,
+    },
     http::{Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
@@ -10,12 +13,12 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{btree_map::Entry, HashMap};
 use std::time::{Duration, Instant};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
-    mal::new_code_verifier,
+    mal::{new_code_verifier, random_token},
     model::{
         AddReq, Anime, AnimeView, ErrorResp, FromMedia, ImportReq, ImportResp, MalStatus,
         NotificationsResp, ReadReq, RefreshResp, SearchResult, UpdateReq, UpdateResp, WatchReq,
@@ -46,7 +49,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/auth/mal/callback", get(mal_callback))
         .route(
             "/api/{*rest}",
-            any(|| async { AppError(StatusCode::NOT_FOUND, "no such API endpoint".into()) }),
+            any(|| async { AppError::not_found("no such API endpoint") }),
         )
         .fallback_service(frontend)
         .layer(middleware::from_fn(csrf_guard))
@@ -81,39 +84,51 @@ async fn csrf_guard(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+// ---------- errors & extractors ----------
+
+/// An API error: an HTTP status plus a message that is safe to show the user.
 pub struct AppError(StatusCode, String);
 
 impl AppError {
     fn bad_request(msg: impl Into<String>) -> Self {
         Self(StatusCode::BAD_REQUEST, msg.into())
     }
-    fn not_found() -> Self {
-        Self(StatusCode::NOT_FOUND, "anime not in your list".into())
+
+    fn not_found(msg: &str) -> Self {
+        Self(StatusCode::NOT_FOUND, msg.into())
     }
-    fn internal(e: &anyhow::Error) -> Self {
+
+    fn not_in_list() -> Self {
+        Self::not_found("anime not in your list")
+    }
+
+    fn already_listed(title: &str) -> Self {
+        Self::bad_request(format!("{title} is already in your list"))
+    }
+
+    /// A local failure (e.g. the data file can't be written). Details go to the log only.
+    fn internal(e: anyhow::Error) -> Self {
         tracing::error!("{e:#}");
         Self(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not save: {e:#}"),
+            "could not save your data (see the server log)".into(),
         )
     }
-}
 
-/// Errors from upstream services (AniList, MyAnimeList) are reported as 502.
-impl<E: Into<anyhow::Error>> From<E> for AppError {
-    fn from(e: E) -> Self {
-        Self(StatusCode::BAD_GATEWAY, format!("{:#}", e.into()))
+    /// AniList or MyAnimeList failed. The top-level message is shown; the cause chain
+    /// (which may contain URLs or response details) goes to the log.
+    fn upstream(e: anyhow::Error) -> Self {
+        tracing::warn!("{e:#}");
+        Self(StatusCode::BAD_GATEWAY, e.to_string())
     }
-}
 
-/// Map a local storage failure to a 500 (instead of the upstream 502).
-trait OrInternal<T> {
-    fn or_internal(self) -> Result<T, AppError>;
-}
-
-impl<T> OrInternal<T> for anyhow::Result<T> {
-    fn or_internal(self) -> Result<T, AppError> {
-        self.map_err(|e| AppError::internal(&e))
+    /// For operations that both call upstream and save (e.g. a refresh).
+    fn classify(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<std::io::Error>().is_some() {
+            Self::internal(e)
+        } else {
+            Self::upstream(e)
+        }
     }
 }
 
@@ -123,70 +138,76 @@ impl IntoResponse for AppError {
     }
 }
 
+macro_rules! rejection_to_app_error {
+    ($($rejection:ty),*) => {$(
+        impl From<$rejection> for AppError {
+            fn from(r: $rejection) -> Self {
+                Self(r.status(), r.body_text())
+            }
+        }
+    )*};
+}
+rejection_to_app_error!(JsonRejection, PathRejection, QueryRejection);
+
+/// `Json` whose rejections use our JSON error shape.
+#[derive(FromRequest)]
+#[from_request(via(Json), rejection(AppError))]
+struct ApiJson<T>(T);
+
+/// `Path` whose rejections use our JSON error shape.
+#[derive(FromRequestParts)]
+#[from_request(via(axum::extract::Path), rejection(AppError))]
+struct ApiPath<T>(T);
+
+/// `Query` whose rejections use our JSON error shape.
+#[derive(FromRequestParts)]
+#[from_request(via(Query), rejection(AppError))]
+struct ApiQuery<T>(T);
+
 type ApiResult<T> = Result<T, AppError>;
+
+// ---------- list ----------
 
 async fn list_anime(State(s): State<SharedState>) -> Json<Vec<AnimeView>> {
     let now = Utc::now();
     let d = s.store.read().await;
-    Json(
-        d.anime
-            .values()
-            .cloned()
-            .map(|a| AnimeView::new(a, now))
-            .collect(),
-    )
+    let list = d.anime.values().cloned().map(|a| AnimeView::new(a, now));
+    Json(list.collect())
 }
 
 async fn add_anime(
     State(s): State<SharedState>,
-    Json(req): Json<AddReq>,
+    ApiJson(req): ApiJson<AddReq>,
 ) -> ApiResult<Json<UpdateResp>> {
     if let Some(existing) = s.store.read().await.anime.get(&req.anilist_id) {
-        return Err(AppError::bad_request(format!(
-            "{} is already in your list",
-            existing.title
-        )));
+        return Err(AppError::already_listed(&existing.title));
     }
-    let media = s.anilist.by_ids(&[req.anilist_id]).await?;
+    let media = s
+        .anilist
+        .by_ids(&[req.anilist_id])
+        .await
+        .map_err(AppError::upstream)?;
     let m = media
         .first()
         .ok_or_else(|| AppError::bad_request("no such anime on AniList"))?;
     let now = Utc::now();
     let mut anime = Anime::from_media(m, req.status, now);
+    let mal_error = merge_with_mal(&s, &mut anime).await;
 
-    // If the show is already on the user's MAL list, adopt that progress instead of
-    // overwriting it; otherwise add it to MAL with the chosen status.
-    let mut mal_error = None;
-    if let (Some(mal), Some(mal_id)) = (&s.mal, anime.mal_id) {
-        match s.mal_token().await {
-            Ok(Some(token)) => match mal.my_list_status(&token, mal_id).await {
-                Ok(Some((status, watched))) => {
-                    anime.import_progress(watched, status.unwrap_or(req.status));
-                }
-                Ok(None) => mal_error = s.sync_to_mal(&anime).await,
-                Err(e) => mal_error = Some(format!("couldn't check your MyAnimeList entry: {e:#}")),
-            },
-            Ok(None) => {}
-            Err(e) => mal_error = Some(format!("{e:#}")),
-        }
-    }
-
+    // Re-check under the write lock: the show may have been added meanwhile.
     let inserted = s
         .store
-        .mutate(|d| {
-            let fresh = !d.anime.contains_key(&anime.anilist_id);
-            if fresh {
-                d.anime.insert(anime.anilist_id, anime.clone());
+        .mutate(|d| match d.anime.entry(anime.anilist_id) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(anime.clone());
+                true
             }
-            fresh
         })
         .await
-        .or_internal()?;
+        .map_err(AppError::internal)?;
     if !inserted {
-        return Err(AppError::bad_request(format!(
-            "{} is already in your list",
-            anime.title
-        )));
+        return Err(AppError::already_listed(&anime.title));
     }
     s.reschedule.notify_one();
     Ok(Json(UpdateResp {
@@ -195,10 +216,32 @@ async fn add_anime(
     }))
 }
 
+/// Reconcile a newly added show with the user's MyAnimeList. If MAL already has
+/// progress for it, adopt that; otherwise add it to MAL with the status the user picked.
+/// Returns a message if MAL couldn't be reached.
+async fn merge_with_mal(s: &SharedState, anime: &mut Anime) -> Option<String> {
+    let (Some(mal), Some(mal_id)) = (&s.mal, anime.mal_id) else {
+        return None;
+    };
+    let token = match s.mal_token().await {
+        Ok(Some(token)) => token,
+        Ok(None) => return None, // not connected
+        Err(e) => return Some(e.to_string()),
+    };
+    match mal.my_list_status(&token, mal_id).await {
+        Ok(Some((status, watched))) if watched > 0 => {
+            anime.import_progress(watched, status.unwrap_or(anime.status));
+            None
+        }
+        Ok(_) => s.sync_to_mal(anime).await,
+        Err(e) => Some(format!("couldn't check your MyAnimeList entry: {e}")),
+    }
+}
+
 async fn update_anime(
     State(s): State<SharedState>,
-    Path(id): Path<i64>,
-    Json(req): Json<UpdateReq>,
+    ApiPath(id): ApiPath<i64>,
+    ApiJson(req): ApiJson<UpdateReq>,
 ) -> ApiResult<Json<UpdateResp>> {
     let now = Utc::now();
     let anime = s
@@ -214,54 +257,54 @@ async fn update_anime(
             Some(a.clone())
         })
         .await
-        .or_internal()?
-        .ok_or_else(AppError::not_found)?;
-    let mal_error = s.sync_to_mal(&anime).await;
-    Ok(Json(UpdateResp {
-        anime: AnimeView::new(anime, now),
-        mal_error,
-    }))
+        .map_err(AppError::internal)?
+        .ok_or_else(AppError::not_in_list)?;
+    respond_after_sync(&s, anime).await
 }
 
 async fn log_watch(
     State(s): State<SharedState>,
-    Path(id): Path<i64>,
-    body: Option<Json<WatchReq>>,
+    ApiPath(id): ApiPath<i64>,
+    ApiJson(req): ApiJson<WatchReq>,
 ) -> ApiResult<Json<UpdateResp>> {
-    let req = body.map(|b| b.0).unwrap_or_default();
     let now = Utc::now();
     let anime = s
         .store
         .mutate(|d| {
             let a = d.anime.get_mut(&id)?;
-            let ep = req.episode.unwrap_or(a.watched + 1);
-            Some(
-                a.log_watch(ep, req.watched_at.unwrap_or(now))
-                    .map(|()| a.clone()),
-            )
+            let episode = req.episode.unwrap_or(a.watched + 1);
+            let logged = a.log_watch(episode, req.watched_at.unwrap_or(now));
+            Some(logged.map(|()| a.clone()))
         })
         .await
-        .or_internal()?
-        .ok_or_else(AppError::not_found)?
+        .map_err(AppError::internal)?
+        .ok_or_else(AppError::not_in_list)?
         .map_err(AppError::bad_request)?;
+    respond_after_sync(&s, anime).await
+}
+
+/// Push a change to MyAnimeList and build the response (MAL failures don't fail the request).
+async fn respond_after_sync(s: &SharedState, anime: Anime) -> ApiResult<Json<UpdateResp>> {
     let mal_error = s.sync_to_mal(&anime).await;
     Ok(Json(UpdateResp {
-        anime: AnimeView::new(anime, now),
+        anime: AnimeView::new(anime, Utc::now()),
         mal_error,
     }))
 }
 
-async fn remove_anime(State(s): State<SharedState>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+async fn remove_anime(
+    State(s): State<SharedState>,
+    ApiPath(id): ApiPath<i64>,
+) -> ApiResult<StatusCode> {
     let removed = s
         .store
         .mutate(|d| d.anime.remove(&id))
         .await
-        .or_internal()?;
-    Ok(if removed.is_some() {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
-    })
+        .map_err(AppError::internal)?;
+    match removed {
+        Some(_) => Ok(StatusCode::NO_CONTENT),
+        None => Err(AppError::not_in_list()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -271,40 +314,38 @@ struct SearchQuery {
 
 async fn search(
     State(s): State<SharedState>,
-    Query(q): Query<SearchQuery>,
+    ApiQuery(q): ApiQuery<SearchQuery>,
 ) -> ApiResult<Json<Vec<SearchResult>>> {
     let q = q.q.trim();
     if q.is_empty() {
         return Ok(Json(vec![]));
     }
-    let media = s.anilist.search(q).await?;
+    let media = s.anilist.search(q).await.map_err(AppError::upstream)?;
     let d = s.store.read().await;
-    Ok(Json(
-        media
-            .into_iter()
-            .map(|m| SearchResult {
-                season: m.season_label(),
-                anilist_id: m.id,
-                title: m.display_title(),
-                title_english: m.title.english.clone(),
-                cover: m.cover_image.and_then(|c| c.large),
-                format: m.format,
-                media_status: m.status,
-                episodes: m.episodes,
-                in_list: d.anime.contains_key(&m.id),
-            })
-            .collect(),
-    ))
+    let results = media.into_iter().map(|m| SearchResult {
+        season: m.season_label(),
+        anilist_id: m.id,
+        title: m.display_title(),
+        title_english: m.title.english.clone(),
+        cover: m.cover_image.and_then(|c| c.large),
+        format: m.format,
+        media_status: m.status,
+        episodes: m.episodes,
+        in_list: d.anime.contains_key(&m.id),
+    });
+    Ok(Json(results.collect()))
 }
 
 async fn refresh(State(s): State<SharedState>) -> ApiResult<Json<RefreshResp>> {
-    let created = poller::refresh_all(&s).await?;
+    let created = poller::refresh_all(&s).await.map_err(AppError::classify)?;
     // Let the poller recompute when to wake up against the fresh data.
     s.reschedule.notify_one();
     Ok(Json(RefreshResp {
         new_notifications: created,
     }))
 }
+
+// ---------- notifications ----------
 
 async fn list_notifications(State(s): State<SharedState>) -> Json<NotificationsResp> {
     let d = s.store.read().await;
@@ -318,18 +359,18 @@ async fn list_notifications(State(s): State<SharedState>) -> Json<NotificationsR
 
 async fn mark_read(
     State(s): State<SharedState>,
-    Json(req): Json<ReadReq>,
+    ApiJson(req): ApiJson<ReadReq>,
 ) -> ApiResult<StatusCode> {
     s.store
         .mutate(|d| {
-            for n in d.notifications.iter_mut() {
+            for n in &mut d.notifications {
                 if req.ids.as_ref().is_none_or(|ids| ids.contains(&n.id)) {
                     n.read = true;
                 }
             }
         })
         .await
-        .or_internal()?;
+        .map_err(AppError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -337,11 +378,15 @@ async fn clear_notifications(State(s): State<SharedState>) -> ApiResult<StatusCo
     s.store
         .mutate(|d| d.notifications.clear())
         .await
-        .or_internal()?;
+        .map_err(AppError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------- MyAnimeList ----------
+
+fn mal_not_configured() -> AppError {
+    AppError::bad_request("MyAnimeList is not configured (set MAL_CLIENT_ID)")
+}
 
 async fn mal_status(State(s): State<SharedState>) -> Json<MalStatus> {
     let d = s.store.read().await;
@@ -355,42 +400,46 @@ async fn mal_status(State(s): State<SharedState>) -> Json<MalStatus> {
 
 async fn mal_import(
     State(s): State<SharedState>,
-    Json(req): Json<ImportReq>,
+    ApiJson(req): ApiJson<ImportReq>,
 ) -> ApiResult<Json<ImportResp>> {
-    let mal = s.mal.as_ref().ok_or_else(|| {
-        AppError::bad_request("MyAnimeList is not configured (set MAL_CLIENT_ID)")
-    })?;
-    let token = s.mal_token().await?;
-    let user = match req
+    let mal = s.mal.as_ref().ok_or_else(mal_not_configured)?;
+    let username = req
         .username
         .as_deref()
         .map(str::trim)
-        .filter(|u| !u.is_empty())
-    {
-        Some(u) => u.to_string(),
-        None if token.is_some() => "@me".to_string(),
-        None => {
-            return Err(AppError::bad_request(
-                "enter a MyAnimeList username or connect your account",
-            ))
-        }
+        .filter(|u| !u.is_empty());
+    // Your own list needs a working login; a public list can be read without one.
+    let (user, token) = match username {
+        Some(u) => (u.to_string(), s.mal_token().await.ok().flatten()),
+        None => match s.mal_token().await.map_err(AppError::upstream)? {
+            Some(token) => ("@me".to_string(), Some(token)),
+            None => {
+                return Err(AppError::bad_request(
+                    "enter a MyAnimeList username or connect your account",
+                ))
+            }
+        },
     };
     let statuses = req.statuses.unwrap_or_else(|| {
-        vec![
-            WatchStatus::Watching,
-            WatchStatus::Planning,
-            WatchStatus::Paused,
-        ]
+        WatchStatus::ALL
+            .into_iter()
+            .filter(|s| s.is_active())
+            .collect()
     });
 
     let entries: Vec<_> = mal
         .user_list(&user, token.as_deref())
-        .await?
+        .await
+        .map_err(AppError::upstream)?
         .into_iter()
         .filter(|e| e.status.is_some_and(|st| statuses.contains(&st)))
         .collect();
     let mal_ids: Vec<i64> = entries.iter().map(|e| e.mal_id).collect();
-    let media = s.anilist.by_mal_ids(&mal_ids).await?;
+    let media = s
+        .anilist
+        .by_mal_ids(&mal_ids)
+        .await
+        .map_err(AppError::upstream)?;
     let by_mal: HashMap<i64, _> = media.iter().filter_map(|m| Some((m.id_mal?, m))).collect();
 
     let now = Utc::now();
@@ -408,50 +457,52 @@ async fn mal_import(
                     continue;
                 };
                 let status = e.status.unwrap_or(WatchStatus::Planning);
-                let a = match d.anime.get_mut(&m.id) {
-                    Some(a) => {
+                let anime = match d.anime.entry(m.id) {
+                    Entry::Occupied(o) => {
                         resp.updated += 1;
-                        a
+                        o.into_mut()
                     }
-                    None => {
+                    Entry::Vacant(v) => {
                         resp.added += 1;
-                        d.anime
-                            .entry(m.id)
-                            .or_insert_with(|| Anime::from_media(m, status, now))
+                        v.insert(Anime::from_media(m, status, now))
                     }
                 };
-                a.mal_id = Some(e.mal_id);
-                a.import_progress(e.watched, status);
+                anime.mal_id = Some(e.mal_id);
+                anime.import_progress(e.watched, status);
             }
             resp
         })
         .await
-        .or_internal()?;
+        .map_err(AppError::internal)?;
     s.reschedule.notify_one();
     Ok(Json(resp))
 }
 
 async fn mal_disconnect(State(s): State<SharedState>) -> ApiResult<StatusCode> {
-    s.store.mutate(|d| d.mal = None).await.or_internal()?;
+    s.store
+        .mutate(|d| d.mal = None)
+        .await
+        .map_err(AppError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn mal_login(State(s): State<SharedState>) -> ApiResult<Redirect> {
-    let mal = s.mal.as_ref().ok_or_else(|| {
-        AppError::bad_request("MyAnimeList is not configured (set MAL_CLIENT_ID)")
-    })?;
+    let mal = s.mal.as_ref().ok_or_else(mal_not_configured)?;
     let verifier = new_code_verifier();
-    let state: String = new_code_verifier().chars().take(32).collect();
-    let url = mal.authorize_url(&verifier, &state, &s.config.mal_redirect_uri())?;
+    let state = random_token(32);
+    let url = mal
+        .authorize_url(&verifier, &state, &s.config.mal_redirect_uri())
+        .map_err(AppError::internal)?;
+
     let mut pending = s.pending_oauth.lock().await;
     pending.retain(|_, (_, created)| created.elapsed() < OAUTH_TTL);
     // Bound memory if someone hammers this endpoint: drop the oldest pending login.
     if pending.len() >= 50 {
-        if let Some(oldest) = pending
+        let oldest = pending
             .iter()
-            .min_by_key(|(_, (_, c))| *c)
-            .map(|(k, _)| k.clone())
-        {
+            .min_by_key(|(_, (_, created))| *created)
+            .map(|(k, _)| k.clone());
+        if let Some(oldest) = oldest {
             pending.remove(&oldest);
         }
     }
@@ -467,48 +518,57 @@ struct CallbackQuery {
 }
 
 async fn mal_callback(State(s): State<SharedState>, Query(q): Query<CallbackQuery>) -> Response {
-    let result: anyhow::Result<()> = async {
-        if let Some(err) = q.error {
-            anyhow::bail!("MyAnimeList denied access: {err}");
-        }
-        let mal = s
-            .mal
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MyAnimeList is not configured"))?;
-        let (Some(code), Some(state)) = (q.code, q.state) else {
-            anyhow::bail!("missing code or state")
-        };
-        let verifier = s
-            .pending_oauth
-            .lock()
-            .await
-            .remove(&state)
-            .filter(|(_, created)| created.elapsed() < OAUTH_TTL)
-            .map(|(verifier, _)| verifier)
-            .ok_or_else(|| anyhow::anyhow!("login session expired, please try again"))?;
-        let mut tokens = mal
-            .exchange_code(&code, &verifier, &s.config.mal_redirect_uri())
-            .await?;
-        tokens.username = mal.me(&tokens.access_token).await.ok();
-        s.store.mutate(|d| d.mal = Some(tokens)).await?;
-        Ok(())
-    }
-    .await;
-    match result {
+    match finish_mal_login(&s, q).await {
         Ok(()) => Redirect::to("/?mal=connected").into_response(),
         Err(e) => {
             tracing::warn!("MAL login failed: {e:#}");
-            let msg: String = format!("{e:#}")
-                .chars()
-                .map(|c| if "<>&\"".contains(c) { ' ' } else { c })
-                .collect();
-            (
-                StatusCode::BAD_REQUEST,
-                Html(format!(
-                    "<h1>MyAnimeList login failed</h1><p>{msg}</p><p><a href=\"/\">Back</a></p>"
-                )),
-            )
-                .into_response()
+            let page = format!(
+                "<h1>MyAnimeList login failed</h1><p>{}</p><p><a href=\"/\">Back</a></p>",
+                html_escape(&e.to_string())
+            );
+            (StatusCode::BAD_REQUEST, Html(page)).into_response()
         }
     }
+}
+
+async fn finish_mal_login(s: &SharedState, q: CallbackQuery) -> anyhow::Result<()> {
+    if let Some(err) = q.error {
+        anyhow::bail!("MyAnimeList denied access: {err}");
+    }
+    let mal = s
+        .mal
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("MyAnimeList is not configured"))?;
+    let (Some(code), Some(state)) = (q.code, q.state) else {
+        anyhow::bail!("missing code or state");
+    };
+    let verifier = s
+        .pending_oauth
+        .lock()
+        .await
+        .remove(&state)
+        .filter(|(_, created)| created.elapsed() < OAUTH_TTL)
+        .map(|(verifier, _)| verifier)
+        .ok_or_else(|| anyhow::anyhow!("login session expired, please try again"))?;
+    let mut tokens = mal
+        .exchange_code(&code, &verifier, &s.config.mal_redirect_uri())
+        .await?;
+    tokens.username = mal.me(&tokens.access_token).await.ok();
+    s.store.mutate(|d| d.mal = Some(tokens)).await?;
+    Ok(())
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }

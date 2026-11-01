@@ -1,6 +1,7 @@
 //! The Leptos UI.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anime_shared::*;
 use chrono::{DateTime, Utc};
@@ -78,9 +79,9 @@ struct Ctx {
 
 impl Ctx {
     fn toast(&self, message: impl Into<String>, error: bool) {
-        let id = self
-            .toast
-            .with_untracked(|t| t.as_ref().map_or(0, |t| t.id + 1));
+        // Ever-increasing, so an old toast's timer can never clear a newer toast.
+        static NEXT_TOAST_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_TOAST_ID.fetch_add(1, Ordering::Relaxed);
         self.toast.set(Some(Toast {
             id,
             message: message.into(),
@@ -148,6 +149,11 @@ impl Ctx {
         if new_arrived {
             self.reload_anime().await;
         }
+    }
+
+    /// Send a partial update (progress and/or status) for one anime.
+    fn patch(self, id: i64, req: UpdateReq) {
+        self.update_with(api::update_anime(id, req));
     }
 
     /// Run an API call that returns an updated anime.
@@ -537,16 +543,7 @@ fn availability_line(a: &Anime, now: DateTime<Utc>) -> (&'static str, String) {
 #[component]
 fn Card(anime: Anime) -> impl IntoView {
     let ctx = expect_context::<Ctx>();
-    let id = anime.anilist_id;
     let total = anime.airing.total_episodes;
-    let aired = anime.airing.latest_aired;
-    let watched = anime.watched;
-    let next = watched + 1;
-    let can_watch_next = total.is_none_or(|t| watched < t);
-    let denom = total.unwrap_or(aired.max(watched).max(1)).max(1) as f64;
-    let watched_pct = (watched as f64 / denom * 100.0).min(100.0);
-    let aired_pct = (aired as f64 / denom * 100.0).min(100.0);
-    let total_suffix = total.map(|t| format!(" / {t}")).unwrap_or_default();
     let meta = media_meta(&[
         anime.airing.format.clone(),
         anime.airing.season.clone(),
@@ -554,55 +551,103 @@ fn Card(anime: Anime) -> impl IntoView {
         pretty_status(&anime.airing.media_status),
         anime.title_english.clone().filter(|e| *e != anime.title),
     ]);
-    let title = anime.title.clone();
-    let status = anime.status;
-    let log: Vec<WatchEvent> = anime.watch_log.iter().rev().cloned().collect();
-    let log_len = log.len();
+    let total_suffix = total.map(|t| format!(" / {t}")).unwrap_or_default();
+    let (watched, aired) = (anime.watched, anime.airing.latest_aired);
+    let link = anime.site_url.clone().unwrap_or_else(|| "#".into());
 
+    // Re-evaluated as time passes (countdowns).
     let for_avail = anime.clone();
-    let avail = move || {
-        let (cls, text) = availability_line(&for_avail, ctx.now.get());
-        view! { <div class=format!("avail {cls}")>{text}</div> }
+    let availability = move || {
+        let (class, text) = availability_line(&for_avail, ctx.now.get());
+        view! { <div class=format!("avail {class}")>{text}</div> }
     };
+
+    view! {
+        <article class="card">
+            {anime.cover.clone().map(|c| view! { <img class="cover" src=c alt="" loading="lazy"/> })}
+            <div class="body">
+                <h3><a href=link target="_blank" rel="noopener">{anime.title.clone()}</a></h3>
+                <div class="sub">{meta}</div>
+                {availability}
+                <div class="sub">
+                    "Watched " <b>{watched}</b> {total_suffix.clone()} " · aired " {aired} {total_suffix}
+                </div>
+                <ProgressBar watched aired total/>
+                <Controls anime=anime.clone()/>
+                <WatchLog anime/>
+            </div>
+        </article>
+    }
+}
+
+#[component]
+fn ProgressBar(watched: u32, aired: u32, total: Option<u32>) -> impl IntoView {
+    let denominator = f64::from(total.unwrap_or(aired.max(watched)).max(1));
+    let percent = |n: u32| (f64::from(n) / denominator * 100.0).min(100.0);
+    view! {
+        <div class="progress" title="dark: watched, light: aired">
+            <div class="aired" style=format!("width:{}%", percent(aired))></div>
+            <div style=format!("width:{}%", percent(watched))></div>
+        </div>
+    }
+}
+
+/// Watched / un-watch buttons, progress box, status menu and remove button.
+#[component]
+fn Controls(anime: Anime) -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let Anime {
+        anilist_id: id,
+        watched,
+        status,
+        title,
+        ..
+    } = anime;
+    let total = anime.airing.total_episodes;
+    let next = watched + 1;
+    let can_watch_next = total.is_none_or(|t| watched < t);
 
     let watch_next = move |_| ctx.update_with(api::log_watch(id, WatchReq::default()));
     let undo = move |_| {
-        ctx.update_with(api::update_anime(
+        ctx.patch(
             id,
             UpdateReq {
                 watched: Some(watched.saturating_sub(1)),
                 ..Default::default()
             },
-        ))
+        )
     };
     let set_progress = move |ev| {
-        // Ignore an empty or invalid field rather than resetting progress to 0.
-        let Ok(v) = event_target_value(&ev).trim().parse::<u32>() else {
-            ctx.error("Progress must be a whole number".into());
-            return;
-        };
-        ctx.update_with(api::update_anime(
-            id,
-            UpdateReq {
-                watched: Some(v),
-                ..Default::default()
-            },
-        ));
+        let input = event_target::<web_sys::HtmlInputElement>(&ev);
+        let typed = input.value();
+        // Show the saved value until the server confirms a change (the card then
+        // re-renders), so an invalid or clamped entry never lingers in the box.
+        input.set_value(&watched.to_string());
+        match typed.trim().parse::<u32>() {
+            Ok(v) if v != watched => ctx.patch(
+                id,
+                UpdateReq {
+                    watched: Some(v),
+                    ..Default::default()
+                },
+            ),
+            Ok(_) => {}
+            Err(_) => ctx.error("Progress must be a whole number".into()),
+        }
     };
     let set_status = move |ev| {
         if let Some(s) = WatchStatus::parse(&event_target_value(&ev)) {
-            ctx.update_with(api::update_anime(
+            ctx.patch(
                 id,
                 UpdateReq {
                     status: Some(s),
                     ..Default::default()
                 },
-            ));
+            );
         }
     };
-    let title_for_remove = title.clone();
     let remove = move |_| {
-        if !browser::confirm(&format!("Remove \"{title_for_remove}\" from your list?")) {
+        if !browser::confirm(&format!("Remove \"{title}\" from your list?")) {
             return;
         }
         spawn_local(async move {
@@ -613,10 +658,42 @@ fn Card(anime: Anime) -> impl IntoView {
         });
     };
 
-    // Log a specific episode at a specific time.
-    let log_ep = RwSignal::new(if can_watch_next { next } else { watched }.to_string());
+    view! {
+        <div class="controls">
+            {can_watch_next.then(|| view! {
+                <button class="primary" on:click=watch_next>{format!("✓ Watched ep {next}")}</button>
+            })}
+            <button on:click=undo disabled=watched == 0 title="Un-watch last episode">"−1"</button>
+            <label class="sub">
+                "Progress "
+                <input type="number" min="0" max=total.map(|t| t.to_string()) prop:value=watched.to_string() on:change=set_progress/>
+            </label>
+            <select on:change=set_status>
+                {WatchStatus::ALL
+                    .into_iter()
+                    .map(|s| view! { <option value=s.as_str() selected=s == status>{s.label()}</option> })
+                    .collect_view()}
+            </select>
+            <button class="danger" on:click=remove title="Remove from list">"🗑"</button>
+        </div>
+    }
+}
+
+/// Collapsible watch history with a form to log an episode at a chosen time.
+#[component]
+fn WatchLog(anime: Anime) -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let id = anime.anilist_id;
+    let total = anime.airing.total_episodes;
+    let suggested = if total.is_none_or(|t| anime.watched < t) {
+        anime.watched + 1
+    } else {
+        anime.watched
+    };
+    let log_ep = RwSignal::new(suggested.to_string());
     let log_at = RwSignal::new(browser::datetime_local_now());
-    let submit_log = move |ev: SubmitEvent| {
+
+    let submit = move |ev: SubmitEvent| {
         ev.prevent_default();
         let (Ok(episode), Some(at)) = (
             log_ep.get_untracked().parse::<u32>(),
@@ -625,85 +702,49 @@ fn Card(anime: Anime) -> impl IntoView {
             ctx.error("Enter an episode number and a valid date".into());
             return;
         };
+        let req = WatchReq {
+            episode: Some(episode),
+            watched_at: Some(at),
+        };
         ctx.update_with_message(
-            api::log_watch(
-                id,
-                WatchReq {
-                    episode: Some(episode),
-                    watched_at: Some(at),
-                },
-            ),
+            api::log_watch(id, req),
             Some(format!("Logged episode {episode}")),
         );
     };
-    let log_open = ctx.open_logs.with_untracked(|s| s.contains(&id));
-    let toggle_log = move |_| {
+    // Remember open/closed across re-renders of this card.
+    let open = ctx.open_logs.with_untracked(|s| s.contains(&id));
+    let toggle = move |_| {
         ctx.open_logs.update(|s| {
             if !s.remove(&id) {
                 s.insert(id);
             }
-        })
+        });
+    };
+    let entries = anime.watch_log.len();
+    let history = if anime.watch_log.is_empty() {
+        view! { <li>"Nothing logged yet"</li> }.into_any()
+    } else {
+        anime
+            .watch_log
+            .into_iter()
+            .rev()
+            .map(|w| view! { <li>{format!("Episode {} — {}", w.episode, browser::fmt_datetime(w.watched_at, true))}</li> })
+            .collect_view()
+            .into_any()
     };
 
     view! {
-        <article class="card">
-            {anime.cover.clone().map(|c| view! { <img class="cover" src=c alt="" loading="lazy"/> })}
-            <div class="body">
-                <h3>
-                    <a href=anime.site_url.clone().unwrap_or_else(|| "#".into()) target="_blank" rel="noopener">
-                        {title}
-                    </a>
-                </h3>
-                <div class="sub">{meta}</div>
-                {avail}
-                <div class="sub">
-                    "Watched " <b>{watched}</b> {total_suffix.clone()} " · aired " {aired} {total_suffix}
-                </div>
-                <div class="progress" title="dark: watched, light: aired">
-                    <div class="aired" style=format!("width:{aired_pct}%")></div>
-                    <div style=format!("width:{watched_pct}%")></div>
-                </div>
-                <div class="controls">
-                    {can_watch_next.then(|| view! {
-                        <button class="primary" on:click=watch_next>{format!("✓ Watched ep {next}")}</button>
-                    })}
-                    <button on:click=undo disabled=watched == 0 title="Un-watch last episode">"−1"</button>
-                    <label class="sub">
-                        "Progress "
-                        <input type="number" min="0" max=total.map(|t| t.to_string()) prop:value=watched.to_string() on:change=set_progress/>
-                    </label>
-                    <select on:change=set_status>
-                        {WatchStatus::ALL
-                            .into_iter()
-                            .map(|s| view! { <option value=s.as_str() selected=s == status>{s.label()}</option> })
-                            .collect_view()}
-                    </select>
-                    <button class="danger" on:click=remove title="Remove from list">"🗑"</button>
-                </div>
-                <details class="log" open=log_open>
-                    <summary on:click=toggle_log>{format!("Watch history ({log_len})")}</summary>
-                    <form on:submit=submit_log>
-                        <span class="sub">"Watched episode"</span>
-                        <input type="number" min="1" max=total.map(|t| t.to_string()) required bind:value=log_ep/>
-                        <span class="sub">"on"</span>
-                        <input type="datetime-local" required bind:value=log_at/>
-                        <button type="submit">"Save"</button>
-                    </form>
-                    <ul>
-                        {if log.is_empty() {
-                            view! { <li>"Nothing logged yet"</li> }.into_any()
-                        } else {
-                            log.into_iter()
-                                .map(|w| view! {
-                                    <li>{format!("Episode {} — {}", w.episode, browser::fmt_datetime(w.watched_at, true))}</li>
-                                })
-                                .collect_view()
-                                .into_any()
-                        }}
-                    </ul>
-                </details>
-            </div>
-        </article>
+        <details class="log" open=open>
+            <summary on:click=toggle>{format!("Watch history ({entries})")}</summary>
+            <form on:submit=submit>
+                <span class="sub">"Watched episode"</span>
+                <input type="number" min="1" max=total.map(|t| t.to_string()) required bind:value=log_ep/>
+                <span class="sub">"on"</span>
+                <input type="datetime-local" required bind:value=log_at/>
+                <button type="submit">"Save"</button>
+            </form>
+            <ul>{history}</ul>
+        </details>
     }
 }
 

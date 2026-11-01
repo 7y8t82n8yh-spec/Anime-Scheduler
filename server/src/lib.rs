@@ -118,20 +118,37 @@ impl AppState {
     }
 
     /// A valid MAL access token, refreshing it if it is about to expire.
-    pub async fn mal_token(&self) -> Result<Option<String>> {
-        let (Some(mal), Some(tokens)) = (&self.mal, self.store.read().await.mal.clone()) else {
+    ///
+    /// # Errors
+    /// Fails if the refresh request or saving the new tokens fails.
+    pub async fn mal_token(self: &Arc<Self>) -> Result<Option<String>> {
+        let Some(tokens) = self.store.read().await.mal.clone() else {
             return Ok(None);
         };
-        let fresh_enough = |t: &model::MalTokens| t.expires_at > Utc::now() + Duration::minutes(5);
-        if fresh_enough(&tokens) {
+        if self.mal.is_none() {
+            return Ok(None);
+        }
+        if tokens_fresh(&tokens) {
             return Ok(Some(tokens.access_token));
         }
-        // Only one refresh at a time; whoever waited re-reads the (possibly new) tokens.
+        // MAL rotates the refresh token, so once a refresh starts it must finish and be
+        // saved even if the request that triggered it is cancelled (e.g. the tab closed).
+        // Running it in its own task guarantees that.
+        let this = Arc::clone(self);
+        tokio::spawn(async move { this.refresh_mal_tokens().await }).await?
+    }
+
+    /// Refresh and store MAL tokens; only one refresh runs at a time.
+    async fn refresh_mal_tokens(&self) -> Result<Option<String>> {
+        let Some(mal) = &self.mal else {
+            return Ok(None);
+        };
         let _guard = self.mal_refresh_lock.lock().await;
+        // Whoever waited for the lock re-reads the (possibly already refreshed) tokens.
         let Some(tokens) = self.store.read().await.mal.clone() else {
             return Ok(None); // disconnected meanwhile
         };
-        if fresh_enough(&tokens) {
+        if tokens_fresh(&tokens) {
             return Ok(Some(tokens.access_token));
         }
         let fresh = mal.refresh(&tokens).await?;
@@ -140,39 +157,40 @@ impl AppState {
             .store
             .mutate(|d| {
                 // Don't resurrect a connection the user removed while we were refreshing.
-                let still_same = d
+                let unchanged = d
                     .mal
                     .as_ref()
                     .is_some_and(|t| t.refresh_token == tokens.refresh_token);
-                if still_same {
+                if unchanged {
                     d.mal = Some(fresh);
                 }
-                still_same
+                unchanged
             })
             .await?;
         Ok(stored.then_some(token))
     }
 
-    /// Push an entry's progress to MyAnimeList if connected. Returns a human-readable
-    /// error on failure (the local change is kept either way).
-    pub async fn sync_to_mal(&self, anime: &Anime) -> Option<String> {
-        let mal = self.mal.as_ref()?;
-        let mal_id = anime.mal_id?;
+    /// Push an entry's progress to MyAnimeList if connected. Returns a short error
+    /// message on failure (the local change is kept either way).
+    pub async fn sync_to_mal(self: &Arc<Self>, anime: &Anime) -> Option<String> {
+        let (Some(mal), Some(mal_id)) = (&self.mal, anime.mal_id) else {
+            return None;
+        };
         let result = async {
-            let Some(token) = self.mal_token().await? else {
-                return Ok(false);
-            };
-            mal.update_progress(&token, mal_id, anime.watched, anime.status)
-                .await?;
-            Ok::<_, anyhow::Error>(true)
+            if let Some(token) = self.mal_token().await? {
+                mal.update_progress(&token, mal_id, anime.watched, anime.status)
+                    .await?;
+            }
+            anyhow::Ok(())
         }
         .await;
-        match result {
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!("MAL sync failed for {}: {e:#}", anime.title);
-                Some(format!("{e:#}"))
-            }
-        }
+        result.err().map(|e| {
+            tracing::warn!("MAL sync failed for {}: {e:#}", anime.title);
+            e.to_string()
+        })
     }
+}
+
+fn tokens_fresh(tokens: &model::MalTokens) -> bool {
+    tokens.expires_at > Utc::now() + Duration::minutes(5)
 }
