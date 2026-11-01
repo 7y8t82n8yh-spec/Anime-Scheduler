@@ -1,7 +1,8 @@
 //! Thin wrappers over browser APIs: local time formatting, localStorage, desktop notifications.
 
+use anime_shared::Notification;
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, Timelike, Utc};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 
 fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
@@ -143,15 +144,29 @@ pub async fn request_notification_permission() {
     }
 }
 
-pub fn show_notification(title: &str, body: &str, icon: Option<&str>, tag: &str) {
+/// Show a desktop notification; clicking it opens the stream (or focuses the app).
+pub fn show_notification(n: &Notification) {
     if notification_permission() != Permission::Granted {
         return;
     }
     let opts = web_sys::NotificationOptions::new();
-    opts.set_body(body);
-    opts.set_tag(tag);
-    if let Some(icon) = icon {
+    opts.set_body(&n.message);
+    opts.set_tag(&format!("anime-{}", n.id));
+    if let Some(icon) = &n.cover {
         opts.set_icon(icon);
     }
-    let _ = web_sys::Notification::new_with_options(title, &opts);
+    let Ok(note) = web_sys::Notification::new_with_options(&n.title, &opts) else {
+        return;
+    };
+    let watch_url = n.watch.as_ref().map(|w| w.url.clone());
+    let on_click = Closure::once_into_js(move || {
+        let w = window();
+        let _ = match watch_url {
+            Some(url) => w.open_with_url_and_target(&url, "_blank").map(drop),
+            None => w.focus(),
+        };
+    });
+    if let Ok(on_click) = on_click.dyn_into::<js_sys::Function>() {
+        note.set_onclick(Some(&on_click));
+    }
 }

@@ -5,12 +5,14 @@ use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
+
+use anime_shared::StreamLink;
 use std::time::Duration;
 
 const FIELDS: &str =
     "id idMal title { romaji english userPreferred } coverImage { large } siteUrl \
     status episodes format season seasonYear startDate { year month day } \
-    nextAiringEpisode { episode airingAt }";
+    nextAiringEpisode { episode airingAt } externalLinks { url site type isDisabled }";
 
 const PER_PAGE: usize = 50;
 
@@ -35,6 +37,19 @@ pub struct Media {
     pub season_year: Option<i32>,
     pub start_date: Option<FuzzyDate>,
     pub next_airing_episode: Option<NextAiring>,
+    #[serde(default)]
+    pub external_links: Option<Vec<ExternalLink>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalLink {
+    pub url: String,
+    pub site: String,
+    /// INFO, STREAMING or SOCIAL.
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub is_disabled: Option<bool>,
 }
 
 impl Media {
@@ -45,6 +60,24 @@ impl Media {
             .or_else(|| self.title.romaji.clone())
             .or_else(|| self.title.english.clone())
             .unwrap_or_else(|| format!("AniList #{}", self.id))
+    }
+
+    /// Official streaming services for this show, one per site. Only plain
+    /// `http(s)` URLs are kept, so a link can never run script in the page.
+    pub fn streaming_links(&self) -> Vec<StreamLink> {
+        let mut links: Vec<StreamLink> = Vec::new();
+        for link in self.external_links.iter().flatten() {
+            let is_streaming = link.kind.as_deref() == Some("STREAMING");
+            let is_web = link.url.starts_with("https://") || link.url.starts_with("http://");
+            let duplicate = links.iter().any(|l| l.site == link.site);
+            if is_streaming && is_web && link.is_disabled != Some(true) && !duplicate {
+                links.push(StreamLink {
+                    site: link.site.clone(),
+                    url: link.url.clone(),
+                });
+            }
+        }
+        links
     }
 
     /// e.g. "Fall 2026".

@@ -107,6 +107,14 @@ main { max-width: 980px; margin: 0 auto; padding: 16px; }
 .avail.upcoming { background: var(--amber-bg); color: var(--amber); }
 .avail.done, .avail.nodate { background: var(--grey-bg); color: var(--muted); }
 
+.watch-links { display: flex; gap: 6px; flex-wrap: wrap; }
+.watch {
+  font-size: .85rem; text-decoration: none; color: var(--accent);
+  border: 1px solid var(--accent); border-radius: 8px; padding: 3px 10px;
+}
+.watch:hover { background: var(--accent); color: #fff; }
+.notif-list .watch-links { margin-top: 4px; }
+
 .progress { height: 6px; background: var(--grey-bg); border-radius: 3px; overflow: hidden; }
 .progress > div { height: 100%; background: var(--accent); }
 .progress > div.aired { background: var(--green); opacity: .35; }

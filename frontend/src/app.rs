@@ -136,12 +136,7 @@ impl Ctx {
         let prev = browser::storage_get(KEY).and_then(|v| v.parse::<i64>().ok());
         let (alerts, high_water) = pending_alerts(&data.notifications, prev);
         for n in &alerts {
-            browser::show_notification(
-                &n.title,
-                &n.message,
-                n.cover.as_deref(),
-                &format!("anime-{}", n.id),
-            );
+            browser::show_notification(n);
         }
         browser::storage_set(KEY, &high_water.to_string());
         let new_arrived = prev.is_some_and(|p| high_water > p);
@@ -569,6 +564,7 @@ fn Card(anime: Anime) -> impl IntoView {
                 <h3><a href=link target="_blank" rel="noopener">{anime.title.clone()}</a></h3>
                 <div class="sub">{meta}</div>
                 {availability}
+                <WatchLinks links=anime.streaming.clone()/>
                 <div class="sub">
                     "Watched " <b>{watched}</b> {total_suffix.clone()} " · aired " {aired} {total_suffix}
                 </div>
@@ -578,6 +574,18 @@ fn Card(anime: Anime) -> impl IntoView {
             </div>
         </article>
     }
+}
+
+/// "▶ Watch on Crunchyroll" links to official streaming services.
+#[component]
+fn WatchLinks(links: Vec<StreamLink>) -> impl IntoView {
+    (!links.is_empty()).then(|| {
+        let links = links
+            .into_iter()
+            .map(|l| view! { <a class="watch" href=l.url target="_blank" rel="noopener">{format!("▶ Watch on {}", l.site)}</a> })
+            .collect_view();
+        view! { <div class="watch-links">{links}</div> }
+    })
 }
 
 #[component]
@@ -813,6 +821,7 @@ fn NotificationsPanel() -> impl IntoView {
                                         <b>{n.title.clone()}</b>
                                         <div>{n.message.clone()}</div>
                                         <div class="sub">{browser::fmt_datetime(n.created_at, true)}</div>
+                                        {n.watch.clone().map(|w| view! { <WatchLinks links=vec![w]/> })}
                                     </div>
                                 </li>
                             })

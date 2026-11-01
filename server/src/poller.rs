@@ -4,7 +4,10 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
-use crate::{model::FromMedia, SharedState};
+use crate::{
+    model::{FromMedia, Notification},
+    SharedState,
+};
 
 /// Re-fetch airing info for every tracked anime. Returns the number of notifications created.
 ///
@@ -21,10 +24,10 @@ pub async fn refresh_all(state: &SharedState) -> Result<usize> {
     }
     let media = state.anilist.by_ids(&ids).await?;
     let now = Utc::now();
-    state
+    let created = state
         .store
         .mutate(|d| {
-            let before = d.notifications.len();
+            let first_new_id = d.next_notification_id;
             let mut fresh = Vec::new();
             for m in &media {
                 if let Some(a) = d.anime.get_mut(&m.id) {
@@ -36,9 +39,27 @@ pub async fn refresh_all(state: &SharedState) -> Result<usize> {
             for (id, eps) in fresh {
                 d.notify_new_episodes(id, eps, now);
             }
-            d.notifications.len().saturating_sub(before)
+            // By id, not position: the list is capped, so old entries may be dropped.
+            d.notifications
+                .iter()
+                .filter(|n| n.id >= first_new_id)
+                .cloned()
+                .collect::<Vec<_>>()
         })
-        .await
+        .await?;
+    push(state, &created).await;
+    Ok(created.len())
+}
+
+/// Send new notifications to the phone via ntfy, if configured. Failures are only
+/// logged: the in-app notification list still has them.
+async fn push(state: &SharedState, notifications: &[Notification]) {
+    let Some(ntfy) = &state.ntfy else { return };
+    for n in notifications {
+        if let Err(e) = ntfy.send(n).await {
+            tracing::warn!("ntfy push failed for {}: {e:#}", n.title);
+        }
+    }
 }
 
 /// How long to sleep before the next refresh.

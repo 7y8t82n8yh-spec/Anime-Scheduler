@@ -12,6 +12,10 @@ entirely in Rust: an [Axum](https://github.com/tokio-rs/axum) server and a
   notifications if you allow them in the browser.
 - **Progress tracking**: one click on "✓ Watched ep N", or set progress directly, or log a
   specific episode with the date/time you watched it. Each show keeps a watch history.
+- **Where to watch**: each show links to the official streaming services that carry it
+  (Crunchyroll, Netflix, …, as listed on AniList).
+- **Phone notifications** (optional) via [ntfy](https://ntfy.sh): new episodes are pushed
+  to your phone even when no browser is open; tapping one opens the stream.
 - **MyAnimeList integration** (optional): import your MAL list, and log in with MAL so
   every progress or status change is synced back to your MAL account.
 
@@ -64,9 +68,24 @@ header (the frontend sends it), which stops other websites from driving it via y
 | `DATA_FILE` | `anime_data.json` | Where your list is saved |
 | `STATIC_DIR` | `frontend/dist` (falls back to the checkout's) | Built WebAssembly frontend to serve |
 | `POLL_MINUTES` | `30` | Max time between airing checks |
+| `NTFY_TOPIC` | – | Turns on phone notifications via ntfy (pick a long random name) |
+| `NTFY_URL` | `https://ntfy.sh` | ntfy server (set this if you self-host) |
+| `NTFY_TOKEN` | – | Access token, for a reserved/protected topic |
 | `MAL_CLIENT_ID` | – | Turns on MyAnimeList import/sync |
 | `MAL_CLIENT_SECRET` | – | Only for MAL clients of type "web" |
 | `RUST_LOG` | `info` | Log level |
+
+### Phone notifications with ntfy
+
+1. Install the ntfy app ([Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy),
+   [iOS](https://apps.apple.com/app/ntfy/id1625396347)) and subscribe to a topic with a long,
+   random name, e.g. `anime-k3v9q2x7wd`. On the public ntfy.sh server anyone who knows the
+   name can read it, so don't pick something guessable (or reserve the topic with an account).
+2. Start the server with `NTFY_TOPIC=anime-k3v9q2x7wd`.
+
+Each new episode then arrives on your phone with the show's cover, a "Watch on …" button and,
+if `PUBLIC_URL` is reachable from your phone, an "Open list" button. The server sends these,
+so it works with every browser tab closed as long as the server is running.
 
 ### Connecting MyAnimeList
 

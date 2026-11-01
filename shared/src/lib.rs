@@ -117,6 +117,17 @@ pub struct Anime {
     pub watch_log: Vec<WatchEvent>,
     pub airing: AiringInfo,
     pub added_at: DateTime<Utc>,
+    /// Official streaming services carrying the show (from AniList).
+    #[serde(default)]
+    pub streaming: Vec<StreamLink>,
+}
+
+/// Where a show can be watched legally, e.g. Crunchyroll.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StreamLink {
+    pub site: String,
+    /// Always an `http(s)://` URL.
+    pub url: String,
 }
 
 impl Anime {
@@ -204,6 +215,7 @@ impl Anime {
             watch_log,
             airing,
             added_at,
+            streaming,
         } = self;
         let AiringInfo {
             media_status,
@@ -228,6 +240,7 @@ impl Anime {
             watched,
             watch_log,
             added_at,
+            streaming,
         )
             .hash(&mut h);
         (
@@ -394,6 +407,9 @@ pub struct Notification {
     pub cover: Option<String>,
     pub created_at: DateTime<Utc>,
     pub read: bool,
+    /// Where to watch the new episode, if the show streams somewhere official.
+    #[serde(default)]
+    pub watch: Option<StreamLink>,
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +557,7 @@ mod tests {
                 ..Default::default()
             },
             added_at: Utc::now(),
+            streaming: vec![],
         }
     }
 
@@ -692,6 +709,7 @@ mod tests {
             cover: None,
             created_at: Utc::now(),
             read,
+            watch: None,
         };
         // First visit: remember, don't alert.
         let (alerts, hw) = pending_alerts(&[], None);

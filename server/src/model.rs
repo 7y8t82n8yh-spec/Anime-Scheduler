@@ -38,6 +38,7 @@ impl FromMedia for Anime {
             watch_log: Vec::new(),
             airing: AiringInfo::default(),
             added_at: now,
+            streaming: Vec::new(),
         };
         a.apply_media(m, now);
         a
@@ -48,6 +49,7 @@ impl FromMedia for Anime {
         self.title_english = m.title.english.clone();
         self.cover = m.cover_image.as_ref().and_then(|c| c.large.clone());
         self.site_url = m.site_url.clone();
+        self.streaming = m.streaming_links();
         if m.id_mal.is_some() {
             self.mal_id = m.id_mal;
         }
@@ -133,6 +135,7 @@ impl Data {
             cover: a.cover.clone(),
             created_at: now,
             read: false,
+            watch: a.streaming.first().cloned(),
         };
         self.next_notification_id += 1;
         self.notifications.push(n);
@@ -165,6 +168,7 @@ mod tests {
             season: Some("FALL".into()),
             season_year: Some(2026),
             start_date: None,
+            external_links: None,
             next_airing_episode: next.map(|(episode, airing_at)| NextAiring { episode, airing_at }),
         }
     }

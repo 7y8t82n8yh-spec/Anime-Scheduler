@@ -1,6 +1,7 @@
 pub mod anilist;
 pub mod mal;
 pub mod model;
+pub mod ntfy;
 pub mod poller;
 pub mod routes;
 pub mod store;
@@ -31,6 +32,12 @@ pub struct Config {
     pub mal_client_secret: Option<String>,
     pub mal_api_base: String,
     pub mal_auth_base: String,
+    /// ntfy server for push notifications, e.g. `https://ntfy.sh`.
+    pub ntfy_server: String,
+    /// ntfy topic to publish to; push notifications are off when unset.
+    pub ntfy_topic: Option<String>,
+    /// Access token for a protected ntfy topic.
+    pub ntfy_token: Option<String>,
 }
 
 impl Config {
@@ -53,6 +60,9 @@ impl Config {
             mal_api_base: var("MAL_API_BASE")
                 .unwrap_or_else(|| "https://api.myanimelist.net".into()),
             mal_auth_base: var("MAL_AUTH_BASE").unwrap_or_else(|| "https://myanimelist.net".into()),
+            ntfy_server: var("NTFY_URL").unwrap_or_else(|| "https://ntfy.sh".into()),
+            ntfy_topic: var("NTFY_TOPIC"),
+            ntfy_token: var("NTFY_TOKEN"),
         }
     }
 
@@ -76,6 +86,7 @@ pub struct AppState {
     pub store: Store,
     pub anilist: AniList,
     pub mal: Option<Mal>,
+    pub ntfy: Option<ntfy::Ntfy>,
     /// Tells the background poller to recompute when it should next wake up.
     pub reschedule: Notify,
     /// Serialises AniList refreshes (poller vs. the Refresh button).
@@ -96,6 +107,15 @@ impl AppState {
             .build()?;
         let store = Store::open(&config.data_file)?;
         let anilist = AniList::new(http.clone(), config.anilist_url.clone());
+        let ntfy = config.ntfy_topic.clone().map(|topic| {
+            ntfy::Ntfy::new(
+                http.clone(),
+                &config.ntfy_server,
+                topic,
+                config.ntfy_token.clone(),
+                &config.public_url,
+            )
+        });
         let mal = config.mal_client_id.clone().map(|id| {
             Mal::new(
                 http,
@@ -110,6 +130,7 @@ impl AppState {
             store,
             anilist,
             mal,
+            ntfy,
             reschedule: Notify::new(),
             refresh_lock: Mutex::new(()),
             mal_refresh_lock: Mutex::new(()),

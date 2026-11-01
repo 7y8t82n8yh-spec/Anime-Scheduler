@@ -21,6 +21,8 @@ struct Mock {
     /// mal id -> (status, watched) already on the user's MAL list
     mal_list: HashMap<i64, (&'static str, u32)>,
     token_calls: usize,
+    /// Messages published to the mock ntfy server.
+    ntfy: Vec<Value>,
 }
 type MockState = Arc<Mutex<Mock>>;
 
@@ -33,6 +35,13 @@ fn media(id: i64, next_ep: Option<u32>) -> Value {
         "episodes": 12, "format": "TV", "season": "FALL", "seasonYear": 2026,
         "startDate": { "year": 2026, "month": 10, "day": 1 },
         "nextAiringEpisode": next_ep.map(|e| json!({ "episode": e, "airingAt": 1_900_000_000 })),
+        "externalLinks": [
+            { "url": format!("https://www.crunchyroll.com/series/{id}"), "site": "Crunchyroll", "type": "STREAMING", "isDisabled": false },
+            { "url": "https://www.crunchyroll.com/other", "site": "Crunchyroll", "type": "STREAMING", "isDisabled": false },
+            { "url": "https://old.example.com", "site": "Gone", "type": "STREAMING", "isDisabled": true },
+            { "url": "javascript:alert(1)", "site": "Evil", "type": "STREAMING", "isDisabled": false },
+            { "url": "https://twitter.com/show", "site": "Twitter", "type": "SOCIAL", "isDisabled": false },
+        ],
     })
 }
 
@@ -100,6 +109,11 @@ async fn mal_token(State(m): State<MockState>) -> Json<Value> {
     )
 }
 
+async fn ntfy(State(m): State<MockState>, Json(body): Json<Value>) -> Json<Value> {
+    m.lock().unwrap().ntfy.push(body);
+    Json(json!({}))
+}
+
 async fn spawn(router: Router) -> String {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -156,6 +170,7 @@ async fn setup(token_expires_at: &str) -> Env {
             .route("/v2/anime/{id}", get(mal_anime))
             .route("/v2/anime/{id}/my_list_status", patch(mal_patch))
             .route("/v1/oauth2/token", post(mal_token))
+            .route("/ntfy", post(ntfy))
             .with_state(mock.clone()),
     )
     .await;
@@ -187,6 +202,9 @@ async fn setup(token_expires_at: &str) -> Env {
         mal_client_secret: None,
         mal_api_base: mock_url.clone(),
         mal_auth_base: mock_url.clone(),
+        ntfy_server: format!("{mock_url}/ntfy"),
+        ntfy_topic: Some("anime-test".into()),
+        ntfy_token: None,
     })
     .unwrap();
     let app = spawn(routes::router(state.clone())).await;
@@ -543,4 +561,63 @@ async fn bad_requests_get_json_errors() {
         .await;
     assert_eq!(status, 404);
     assert_eq!(v["error"], "anime not in your list");
+}
+
+#[tokio::test]
+async fn streaming_links_are_filtered() {
+    let env = setup("2099-01-01T00:00:00Z").await;
+    let res = env.post("/api/anime", json!({ "anilist_id": 1 })).await;
+    // One per site, enabled, streaming-type, http(s) only.
+    assert_eq!(
+        res["anime"]["streaming"],
+        json!([{ "site": "Crunchyroll", "url": "https://www.crunchyroll.com/series/1" }])
+    );
+}
+
+#[tokio::test]
+async fn new_episodes_are_pushed_to_ntfy() {
+    let env = setup("2099-01-01T00:00:00Z").await;
+    env.post(
+        "/api/anime",
+        json!({ "anilist_id": 1, "status": "watching" }),
+    )
+    .await;
+    // Fill the notification list to its cap, so new entries displace old ones.
+    env.state
+        .store
+        .mutate(|d| {
+            let template = anime_scheduler::model::Notification {
+                id: 0,
+                anilist_id: 1,
+                title: "old".into(),
+                message: "old".into(),
+                cover: None,
+                created_at: chrono::Utc::now(),
+                read: true,
+                watch: None,
+            };
+            d.notifications = (0..300)
+                .map(|id| anime_scheduler::model::Notification {
+                    id,
+                    ..template.clone()
+                })
+                .collect();
+            d.next_notification_id = 300;
+        })
+        .await
+        .unwrap();
+
+    env.mock.lock().unwrap().next_ep.insert(1, 6);
+    assert_eq!(poller::refresh_all(&env.state).await.unwrap(), 1);
+
+    let m = env.mock.lock().unwrap();
+    assert_eq!(m.ntfy.len(), 1, "exactly the new notification is pushed");
+    let msg = &m.ntfy[0];
+    assert_eq!(msg["topic"], "anime-test");
+    assert_eq!(msg["title"], "Show 1");
+    assert_eq!(msg["message"], "Episodes 4–5 are out!");
+    assert_eq!(msg["click"], "https://www.crunchyroll.com/series/1");
+    assert_eq!(msg["actions"][0]["label"], "Watch on Crunchyroll");
+    // The app runs on localhost in tests, which a phone can't open: no "Open list" button.
+    assert_eq!(msg["actions"].as_array().unwrap().len(), 1);
 }
