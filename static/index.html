@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Anime Scheduler</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>📺 Anime Scheduler</h1>
+    <div class="top-actions">
+      <button id="refresh-btn" title="Check for new episodes now">⟳ Refresh</button>
+      <button id="mal-btn" title="MyAnimeList">MAL</button>
+      <button id="bell-btn" class="bell" title="Notifications">🔔<span id="bell-count" class="badge" hidden>0</span></button>
+    </div>
+  </header>
+
+  <main>
+    <section class="add">
+      <form id="search-form">
+        <input id="search-input" type="search" placeholder="Search AniList to add an anime…" autocomplete="off">
+        <button type="submit">Search</button>
+      </form>
+      <div id="search-results" class="search-results"></div>
+    </section>
+
+    <nav class="tabs" id="tabs">
+      <button data-tab="active" class="active">Up next</button>
+      <button data-tab="watching">Watching</button>
+      <button data-tab="planning">Plan to watch</button>
+      <button data-tab="paused">Paused</button>
+      <button data-tab="completed">Completed</button>
+      <button data-tab="dropped">Dropped</button>
+      <button data-tab="all">All</button>
+    </nav>
+
+    <div id="toast" class="toast" hidden></div>
+    <div id="list" class="list"></div>
+  </main>
+
+  <aside id="notif-panel" class="panel" hidden>
+    <div class="panel-head">
+      <h2>Notifications</h2>
+      <div>
+        <button id="notif-enable" hidden>Enable browser alerts</button>
+        <button id="notif-read">Mark all read</button>
+        <button id="notif-clear">Clear</button>
+        <button class="close" data-close="notif-panel">✕</button>
+      </div>
+    </div>
+    <ul id="notif-list" class="notif-list"></ul>
+  </aside>
+
+  <aside id="mal-panel" class="panel" hidden>
+    <div class="panel-head">
+      <h2>MyAnimeList</h2>
+      <button class="close" data-close="mal-panel">✕</button>
+    </div>
+    <div id="mal-body" class="mal-body"></div>
+  </aside>
+
+  <script src="/app.js"></script>
+</body>
+</html>
