@@ -95,6 +95,12 @@ async fn full_flow() {
     .await;
 
     let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dist")).unwrap();
+    std::fs::write(
+        dir.path().join("dist/index.html"),
+        "<title>Anime Scheduler</title>",
+    )
+    .unwrap();
     let data_file = dir.path().join("data.json");
     // Pretend we're already logged in to MAL.
     std::fs::write(
@@ -108,6 +114,7 @@ async fn full_flow() {
         bind: "127.0.0.1:0".into(),
         public_url: "http://localhost".into(),
         data_file: data_file.to_string_lossy().into(),
+        static_dir: dir.path().join("dist").to_string_lossy().into(),
         poll_minutes: 30,
         anilist_url: format!("{mock_url}/graphql"),
         mal_client_id: Some("cid".into()),
@@ -119,9 +126,18 @@ async fn full_flow() {
     let app = spawn(routes::router(state.clone())).await;
     let c = reqwest::Client::new();
 
-    // Frontend is served.
-    let html = c.get(&app).send().await.unwrap().text().await.unwrap();
-    assert!(html.contains("Anime Scheduler"));
+    // Frontend is served, including for unknown (client-side) paths.
+    for path in ["", "/some/page"] {
+        let html = c
+            .get(format!("{app}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(html.contains("Anime Scheduler"), "{path}: {html}");
+    }
 
     // Search + add.
     let res: Value = c

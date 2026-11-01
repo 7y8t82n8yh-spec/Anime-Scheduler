@@ -22,6 +22,8 @@ pub struct Config {
     /// Base URL the browser uses to reach this app (for the MAL OAuth redirect).
     pub public_url: String,
     pub data_file: String,
+    /// Directory holding the built WebAssembly frontend (`trunk build` output).
+    pub static_dir: String,
     pub poll_minutes: u64,
     pub anilist_url: String,
     pub mal_client_id: Option<String>,
@@ -39,6 +41,7 @@ impl Config {
             public_url: public_url.trim_end_matches('/').to_string(),
             bind,
             data_file: var("DATA_FILE").unwrap_or_else(|| "anime_data.json".into()),
+            static_dir: var("STATIC_DIR").unwrap_or_else(|| "frontend/dist".into()),
             poll_minutes: var("POLL_MINUTES")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30)

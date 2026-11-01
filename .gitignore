@@ -2,3 +2,4 @@
 anime_data.json
 anime_data.json.tmp
 .env
+/frontend/dist

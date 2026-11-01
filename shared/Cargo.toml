@@ -1,0 +1,13 @@
+[package]
+name = "anime-shared"
+description = "Types and pure logic shared by the Anime Scheduler server and its WebAssembly frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

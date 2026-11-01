@@ -1,13 +1,14 @@
-//! Core data model and the pure logic that works on it (availability, new-episode detection).
+//! Types and pure logic shared by the server and the WebAssembly frontend.
+//!
+//! Everything here compiles for both native targets and `wasm32-unknown-unknown`,
+//! so the browser computes "what can I watch now / when is the next episode" with
+//! exactly the same code as the server.
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
-use crate::anilist::Media;
 
 /// Where an anime sits in *your* list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchStatus {
     Watching,
@@ -18,9 +19,42 @@ pub enum WatchStatus {
 }
 
 impl WatchStatus {
-    /// Statuses for which new-episode notifications are generated.
-    pub fn notifies(self) -> bool {
+    pub const ALL: [WatchStatus; 5] = [
+        Self::Watching,
+        Self::Planning,
+        Self::Paused,
+        Self::Completed,
+        Self::Dropped,
+    ];
+
+    /// Statuses that make up the "up next" view and generate new-episode notifications.
+    pub fn is_active(self) -> bool {
         matches!(self, Self::Watching | Self::Planning | Self::Paused)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Watching => "Watching",
+            Self::Planning => "Plan to watch",
+            Self::Paused => "Paused",
+            Self::Completed => "Completed",
+            Self::Dropped => "Dropped",
+        }
+    }
+
+    /// The snake_case name used in JSON and form values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Watching => "watching",
+            Self::Planning => "planning",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|st| st.as_str() == s)
     }
 
     pub fn to_mal(self) -> &'static str {
@@ -46,7 +80,7 @@ impl WatchStatus {
 }
 
 /// Airing information as last fetched from AniList.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AiringInfo {
     /// AniList media status: FINISHED, RELEASING, NOT_YET_RELEASED, CANCELLED, HIATUS.
     pub media_status: Option<String>,
@@ -61,13 +95,13 @@ pub struct AiringInfo {
     pub fetched_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchEvent {
     pub episode: u32,
     pub watched_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Anime {
     pub anilist_id: i64,
     pub mal_id: Option<i64>,
@@ -85,79 +119,8 @@ pub struct Anime {
     pub added_at: DateTime<Utc>,
 }
 
-/// A range of episodes that newly became available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NewEpisodes {
-    pub from: u32,
-    pub to: u32,
-}
-
 impl Anime {
-    pub fn from_media(m: &Media, status: WatchStatus, now: DateTime<Utc>) -> Self {
-        let mut a = Anime {
-            anilist_id: m.id,
-            mal_id: m.id_mal,
-            title: String::new(),
-            title_english: None,
-            cover: None,
-            site_url: None,
-            status,
-            watched: 0,
-            watch_log: Vec::new(),
-            airing: AiringInfo::default(),
-            added_at: now,
-        };
-        a.apply_media(m, now);
-        a
-    }
-
-    /// Update metadata from a fresh AniList fetch. Returns the episodes that became
-    /// available since the previous fetch (never on the very first fetch).
-    pub fn apply_media(&mut self, m: &Media, now: DateTime<Utc>) -> Option<NewEpisodes> {
-        self.title = m.display_title();
-        self.title_english = m.title.english.clone();
-        self.cover = m.cover_image.as_ref().and_then(|c| c.large.clone());
-        self.site_url = m.site_url.clone();
-        if m.id_mal.is_some() {
-            self.mal_id = m.id_mal;
-        }
-
-        let first_fetch = self.airing.fetched_at.is_none();
-        let prev = self.airing.latest_aired;
-        let latest = latest_aired(
-            m.status.as_deref(),
-            m.episodes,
-            m.next_airing_episode.as_ref().map(|n| n.episode),
-            prev,
-        );
-
-        self.airing = AiringInfo {
-            media_status: m.status.clone(),
-            total_episodes: m.episodes,
-            latest_aired: latest,
-            next_episode: m.next_airing_episode.as_ref().map(|n| n.episode),
-            next_airing_at: m
-                .next_airing_episode
-                .as_ref()
-                .and_then(|n| DateTime::from_timestamp(n.airing_at, 0)),
-            start_date: m.start_date.as_ref().and_then(|d| d.to_naive()),
-            format: m.format.clone(),
-            season: match (&m.season, m.season_year) {
-                (Some(s), Some(y)) => Some(format!("{} {}", capitalize(s), y)),
-                (None, Some(y)) => Some(y.to_string()),
-                _ => None,
-            },
-            fetched_at: Some(now),
-        };
-
-        (!first_fetch && latest > prev).then_some(NewEpisodes {
-            from: prev + 1,
-            to: latest,
-        })
-    }
-
-    /// Record that `episode` was watched at `at`. Progress becomes at least `episode`;
-    /// every episode up to it without a log entry gets one.
+    /// Record that `episode` was watched at `at`. Progress becomes at least `episode`.
     pub fn log_watch(&mut self, episode: u32, at: DateTime<Utc>) {
         if episode == 0 {
             return;
@@ -177,8 +140,8 @@ impl Anime {
         self.after_progress_change();
     }
 
-    /// Set progress directly. Log entries above the new progress are dropped; new
-    /// episodes get logged as watched at `at`.
+    /// Set progress directly. Log entries above the new progress are dropped; newly
+    /// covered episodes get logged as watched at `at`.
     pub fn set_progress(&mut self, watched: u32, at: DateTime<Utc>) {
         let watched = match self.airing.total_episodes {
             Some(t) if t > 0 => watched.min(t),
@@ -237,8 +200,8 @@ impl Anime {
     }
 }
 
-/// What the user can do with this anime right now.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// What can be watched right now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Availability {
     /// Unwatched episodes `from..=to` are out.
@@ -258,6 +221,25 @@ pub enum Availability {
     },
 }
 
+impl Availability {
+    /// Sort order for the "up next" list: available first (most episodes first), then
+    /// soonest upcoming, then undated, then finished.
+    pub fn sort_key(&self) -> (u8, i64) {
+        match self {
+            Self::Available { count, .. } => (0, -(*count as i64)),
+            Self::Upcoming { airing_at, .. } => (1, airing_at.timestamp()),
+            Self::NoDate { start_date, .. } => (
+                2,
+                start_date
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .map(|d| d.and_utc().timestamp())
+                    .unwrap_or(i64::MAX),
+            ),
+            Self::AllWatched => (3, 0),
+        }
+    }
+}
+
 /// Work out the highest aired episode from AniList data, falling back to what we knew.
 pub fn latest_aired(
     status: Option<&str>,
@@ -275,16 +257,7 @@ pub fn latest_aired(
     }
 }
 
-fn capitalize(s: &str) -> String {
-    let lower = s.to_lowercase();
-    let mut c = lower.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Notification {
     pub id: u64,
     pub anilist_id: i64,
@@ -295,83 +268,145 @@ pub struct Notification {
     pub read: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MalTokens {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub expires_at: DateTime<Utc>,
-    pub username: Option<String>,
+// ---------------------------------------------------------------------------
+// HTTP API payloads
+// ---------------------------------------------------------------------------
+
+/// An anime as returned by the API, with its availability at response time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnimeView {
+    #[serde(flatten)]
+    pub anime: Anime,
+    pub availability: Availability,
 }
 
-/// Everything that gets persisted to disk.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Data {
-    #[serde(default)]
-    pub anime: BTreeMap<i64, Anime>,
-    #[serde(default)]
-    pub notifications: Vec<Notification>,
-    #[serde(default)]
-    pub next_notification_id: u64,
-    #[serde(default)]
-    pub mal: Option<MalTokens>,
-}
-
-const MAX_NOTIFICATIONS: usize = 300;
-
-impl Data {
-    pub fn notify_new_episodes(&mut self, anilist_id: i64, eps: NewEpisodes, now: DateTime<Utc>) {
-        let Some(a) = self.anime.get(&anilist_id) else {
-            return;
-        };
-        if !a.status.notifies() {
-            return;
-        }
-        let message = if eps.from == eps.to {
-            format!("Episode {} is out!", eps.to)
-        } else {
-            format!("Episodes {}–{} are out!", eps.from, eps.to)
-        };
-        let n = Notification {
-            id: self.next_notification_id,
-            anilist_id,
-            title: a.title.clone(),
-            message,
-            cover: a.cover.clone(),
-            created_at: now,
-            read: false,
-        };
-        self.next_notification_id += 1;
-        self.notifications.push(n);
-        if self.notifications.len() > MAX_NOTIFICATIONS {
-            let excess = self.notifications.len() - MAX_NOTIFICATIONS;
-            self.notifications.drain(..excess);
+impl AnimeView {
+    pub fn new(anime: Anime, now: DateTime<Utc>) -> Self {
+        let availability = anime.availability(now);
+        Self {
+            anime,
+            availability,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddReq {
+    pub anilist_id: i64,
+    #[serde(default = "default_status")]
+    pub status: WatchStatus,
+}
+
+fn default_status() -> WatchStatus {
+    WatchStatus::Planning
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateReq {
+    pub status: Option<WatchStatus>,
+    pub watched: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WatchReq {
+    /// Defaults to the next unwatched episode.
+    pub episode: Option<u32>,
+    /// Defaults to now.
+    pub watched_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateResp {
+    pub anime: AnimeView,
+    /// Set when the change could not be pushed to MyAnimeList.
+    pub mal_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub anilist_id: i64,
+    pub title: String,
+    pub title_english: Option<String>,
+    pub cover: Option<String>,
+    pub format: Option<String>,
+    pub season: Option<String>,
+    pub media_status: Option<String>,
+    pub episodes: Option<u32>,
+    pub in_list: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshResp {
+    pub new_notifications: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsResp {
+    pub unread: usize,
+    /// Newest first.
+    pub notifications: Vec<Notification>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReadReq {
+    /// Omit to mark all as read.
+    pub ids: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MalStatus {
+    pub configured: bool,
+    pub connected: bool,
+    pub username: Option<String>,
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportReq {
+    /// MAL username; defaults to the connected account.
+    pub username: Option<String>,
+    /// Which list statuses to import (default: watching, planning, paused).
+    pub statuses: Option<Vec<WatchStatus>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportResp {
+    pub added: usize,
+    pub updated: usize,
+    /// Titles that could not be matched to AniList.
+    pub unmatched: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorResp {
+    pub error: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anilist::{NextAiring, Title};
 
-    fn media(status: &str, episodes: Option<u32>, next: Option<(u32, i64)>) -> Media {
-        Media {
-            id: 1,
-            id_mal: Some(10),
-            title: Title {
-                romaji: Some("Test".into()),
-                english: None,
-                user_preferred: None,
-            },
-            cover_image: None,
+    fn anime(status: &str, total: Option<u32>, latest: u32, next: Option<(u32, i64)>) -> Anime {
+        Anime {
+            anilist_id: 1,
+            mal_id: None,
+            title: "Test".into(),
+            title_english: None,
+            cover: None,
             site_url: None,
-            status: Some(status.into()),
-            episodes,
-            format: None,
-            season: None,
-            season_year: None,
-            start_date: None,
-            next_airing_episode: next.map(|(episode, airing_at)| NextAiring { episode, airing_at }),
+            status: WatchStatus::Planning,
+            watched: 0,
+            watch_log: vec![],
+            airing: AiringInfo {
+                media_status: Some(status.into()),
+                total_episodes: total,
+                latest_aired: latest,
+                next_episode: next.map(|n| n.0),
+                next_airing_at: next.and_then(|n| DateTime::from_timestamp(n.1, 0)),
+                fetched_at: Some(Utc::now()),
+                ..Default::default()
+            },
+            added_at: Utc::now(),
         }
     }
 
@@ -388,11 +423,7 @@ mod tests {
     fn availability_states() {
         let now = Utc::now();
         let at = now.timestamp() + 3600;
-        let mut a = Anime::from_media(
-            &media("RELEASING", Some(12), Some((5, at))),
-            WatchStatus::Planning,
-            now,
-        );
+        let mut a = anime("RELEASING", Some(12), 4, Some((5, at)));
         assert_eq!(
             a.availability(now),
             Availability::Available {
@@ -401,7 +432,6 @@ mod tests {
                 count: 4
             }
         );
-
         a.set_progress(4, now);
         assert_eq!(a.status, WatchStatus::Watching);
         match a.availability(now) {
@@ -415,42 +445,14 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-
-        let b = Anime::from_media(&media("RELEASING", None, None), WatchStatus::Planning, now);
+        let b = anime("RELEASING", None, 0, None);
         assert!(matches!(b.availability(now), Availability::NoDate { .. }));
-    }
-
-    #[test]
-    fn detects_new_episodes_only_after_first_fetch() {
-        let now = Utc::now();
-        let mut a = Anime::from_media(
-            &media("RELEASING", Some(12), Some((3, 0))),
-            WatchStatus::Watching,
-            now,
-        );
-        assert_eq!(a.airing.latest_aired, 2);
-        assert_eq!(
-            a.apply_media(&media("RELEASING", Some(12), Some((3, 0))), now),
-            None
-        );
-        assert_eq!(
-            a.apply_media(&media("RELEASING", Some(12), Some((5, 0))), now),
-            Some(NewEpisodes { from: 3, to: 4 })
-        );
-        assert_eq!(
-            a.apply_media(&media("FINISHED", Some(12), None), now),
-            Some(NewEpisodes { from: 5, to: 12 })
-        );
     }
 
     #[test]
     fn progress_and_log() {
         let now = Utc::now();
-        let mut a = Anime::from_media(
-            &media("FINISHED", Some(3), None),
-            WatchStatus::Planning,
-            now,
-        );
+        let mut a = anime("FINISHED", Some(3), 3, None);
         a.log_watch(1, now);
         assert_eq!(a.watched, 1);
         assert_eq!(a.status, WatchStatus::Watching);
@@ -465,21 +467,30 @@ mod tests {
     }
 
     #[test]
-    fn notifications_respect_status() {
+    fn sort_order() {
         let now = Utc::now();
-        let mut d = Data::default();
-        let mut a = Anime::from_media(
-            &media("RELEASING", None, Some((2, 0))),
-            WatchStatus::Dropped,
-            now,
+        let avail = anime("RELEASING", None, 3, Some((4, now.timestamp() + 10)));
+        let soon = anime("RELEASING", None, 0, Some((1, now.timestamp() + 10)));
+        let later = anime("RELEASING", None, 0, Some((1, now.timestamp() + 1000)));
+        let done = anime("FINISHED", Some(1), 0, None);
+        let mut v = [&done, &later, &avail, &soon];
+        v.sort_by_key(|a| a.availability(now).sort_key());
+        assert_eq!(
+            v.map(|a| a.airing.next_airing_at),
+            [&avail, &soon, &later, &done].map(|a| a.airing.next_airing_at)
         );
-        d.anime.insert(1, a.clone());
-        d.notify_new_episodes(1, NewEpisodes { from: 2, to: 2 }, now);
-        assert!(d.notifications.is_empty());
-        a.status = WatchStatus::Watching;
-        d.anime.insert(1, a);
-        d.notify_new_episodes(1, NewEpisodes { from: 2, to: 3 }, now);
-        assert_eq!(d.notifications.len(), 1);
-        assert_eq!(d.notifications[0].message, "Episodes 2–3 are out!");
+    }
+
+    #[test]
+    fn view_roundtrip() {
+        let v = AnimeView::new(
+            anime("RELEASING", Some(12), 4, Some((5, 1_900_000_000))),
+            Utc::now(),
+        );
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["availability"]["kind"], "available");
+        assert_eq!(json["anilist_id"], 1, "anime fields are flattened");
+        let back: AnimeView = serde_json::from_value(json).unwrap();
+        assert_eq!(back, v);
     }
 }

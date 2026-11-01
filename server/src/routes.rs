@@ -2,36 +2,31 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, patch, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use chrono::Utc;
+use serde::Deserialize;
 use std::collections::HashMap;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     mal::new_code_verifier,
-    model::{Anime, Availability, WatchStatus},
+    model::{
+        AddReq, Anime, AnimeView, ErrorResp, FromMedia, ImportReq, ImportResp, MalStatus,
+        NotificationsResp, ReadReq, RefreshResp, SearchResult, UpdateReq, UpdateResp, WatchReq,
+        WatchStatus,
+    },
     poller, SharedState,
 };
 
 pub fn router(state: SharedState) -> Router {
+    let dir = std::path::PathBuf::from(&state.config.static_dir);
+    // The WebAssembly frontend (built with `trunk build`) is served from `static_dir`.
+    let frontend = ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html")));
     Router::new()
-        .route(
-            "/",
-            get(|| async { Html(include_str!("../static/index.html")) }),
-        )
-        .route(
-            "/app.js",
-            get(|| async { static_file("text/javascript", include_str!("../static/app.js")) }),
-        )
-        .route(
-            "/style.css",
-            get(|| async { static_file("text/css", include_str!("../static/style.css")) }),
-        )
         .route("/api/anime", get(list_anime).post(add_anime))
         .route("/api/anime/{id}", patch(update_anime).delete(remove_anime))
         .route("/api/anime/{id}/watch", post(log_watch))
@@ -47,18 +42,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/mal/disconnect", post(mal_disconnect))
         .route("/auth/mal/login", get(mal_login))
         .route("/auth/mal/callback", get(mal_callback))
+        .fallback_service(frontend)
         .with_state(state)
-}
-
-fn static_file(content_type: &'static str, body: &'static str) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
 }
 
 pub struct AppError(StatusCode, String);
@@ -80,28 +65,11 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        (self.0, Json(ErrorResp { error: self.1 })).into_response()
     }
 }
 
 type ApiResult<T> = Result<T, AppError>;
-
-#[derive(Serialize)]
-pub struct AnimeView {
-    #[serde(flatten)]
-    anime: Anime,
-    availability: Availability,
-}
-
-impl AnimeView {
-    fn new(anime: Anime, now: DateTime<Utc>) -> Self {
-        let availability = anime.availability(now);
-        Self {
-            anime,
-            availability,
-        }
-    }
-}
 
 async fn list_anime(State(s): State<SharedState>) -> Json<Vec<AnimeView>> {
     let now = Utc::now();
@@ -113,24 +81,6 @@ async fn list_anime(State(s): State<SharedState>) -> Json<Vec<AnimeView>> {
             .map(|a| AnimeView::new(a, now))
             .collect(),
     )
-}
-
-#[derive(Deserialize)]
-struct AddReq {
-    anilist_id: i64,
-    #[serde(default = "default_status")]
-    status: WatchStatus,
-}
-
-fn default_status() -> WatchStatus {
-    WatchStatus::Planning
-}
-
-#[derive(Serialize)]
-struct UpdateResp {
-    anime: AnimeView,
-    /// Set when the change could not be pushed to MyAnimeList.
-    mal_error: Option<String>,
 }
 
 async fn add_anime(
@@ -159,12 +109,6 @@ async fn add_anime(
     }))
 }
 
-#[derive(Deserialize)]
-struct UpdateReq {
-    status: Option<WatchStatus>,
-    watched: Option<u32>,
-}
-
 async fn update_anime(
     State(s): State<SharedState>,
     Path(id): Path<i64>,
@@ -190,14 +134,6 @@ async fn update_anime(
         anime: AnimeView::new(anime, now),
         mal_error,
     }))
-}
-
-#[derive(Deserialize, Default)]
-struct WatchReq {
-    /// Defaults to the next unwatched episode.
-    episode: Option<u32>,
-    /// Defaults to now.
-    watched_at: Option<DateTime<Utc>>,
 }
 
 async fn log_watch(
@@ -238,19 +174,6 @@ struct SearchQuery {
     q: String,
 }
 
-#[derive(Serialize)]
-struct SearchResult {
-    anilist_id: i64,
-    title: String,
-    title_english: Option<String>,
-    cover: Option<String>,
-    format: Option<String>,
-    season: Option<String>,
-    media_status: Option<String>,
-    episodes: Option<u32>,
-    in_list: bool,
-}
-
 async fn search(
     State(s): State<SharedState>,
     Query(q): Query<SearchQuery>,
@@ -265,15 +188,12 @@ async fn search(
         media
             .into_iter()
             .map(|m| SearchResult {
+                season: m.season_label(),
                 anilist_id: m.id,
                 title: m.display_title(),
                 title_english: m.title.english.clone(),
                 cover: m.cover_image.and_then(|c| c.large),
                 format: m.format,
-                season: match (m.season, m.season_year) {
-                    (Some(s), Some(y)) => Some(format!("{s} {y}")),
-                    (_, y) => y.map(|y| y.to_string()),
-                },
                 media_status: m.status,
                 episodes: m.episodes,
                 in_list: d.anime.contains_key(&m.id),
@@ -282,24 +202,23 @@ async fn search(
     ))
 }
 
-async fn refresh(State(s): State<SharedState>) -> ApiResult<Json<serde_json::Value>> {
+async fn refresh(State(s): State<SharedState>) -> ApiResult<Json<RefreshResp>> {
     let created = poller::refresh_all(&s).await?;
     // Let the poller recompute its schedule against the fresh data.
     s.refresh_now.notify_one();
-    Ok(Json(json!({ "new_notifications": created })))
+    Ok(Json(RefreshResp {
+        new_notifications: created,
+    }))
 }
 
-async fn list_notifications(State(s): State<SharedState>) -> Json<serde_json::Value> {
+async fn list_notifications(State(s): State<SharedState>) -> Json<NotificationsResp> {
     let d = s.store.read().await;
-    let list: Vec<_> = d.notifications.iter().rev().cloned().collect();
-    let unread = list.iter().filter(|n| !n.read).count();
-    Json(json!({ "unread": unread, "notifications": list }))
-}
-
-#[derive(Deserialize)]
-struct ReadReq {
-    /// Omit to mark all as read.
-    ids: Option<Vec<u64>>,
+    let notifications: Vec<_> = d.notifications.iter().rev().cloned().collect();
+    let unread = notifications.iter().filter(|n| !n.read).count();
+    Json(NotificationsResp {
+        unread,
+        notifications,
+    })
 }
 
 async fn mark_read(
@@ -325,30 +244,14 @@ async fn clear_notifications(State(s): State<SharedState>) -> ApiResult<StatusCo
 
 // ---------- MyAnimeList ----------
 
-async fn mal_status(State(s): State<SharedState>) -> Json<serde_json::Value> {
+async fn mal_status(State(s): State<SharedState>) -> Json<MalStatus> {
     let d = s.store.read().await;
-    Json(json!({
-        "configured": s.mal.is_some(),
-        "connected": d.mal.is_some(),
-        "username": d.mal.as_ref().and_then(|t| t.username.clone()),
-        "redirect_uri": s.config.mal_redirect_uri(),
-    }))
-}
-
-#[derive(Deserialize)]
-struct ImportReq {
-    /// MAL username; defaults to the connected account.
-    username: Option<String>,
-    /// Which list statuses to import (default: watching, planning, paused).
-    statuses: Option<Vec<WatchStatus>>,
-}
-
-#[derive(Serialize)]
-struct ImportResp {
-    added: usize,
-    updated: usize,
-    /// Titles that could not be matched to AniList.
-    unmatched: Vec<String>,
+    Json(MalStatus {
+        configured: s.mal.is_some(),
+        connected: d.mal.is_some(),
+        username: d.mal.as_ref().and_then(|t| t.username.clone()),
+        redirect_uri: s.config.mal_redirect_uri(),
+    })
 }
 
 async fn mal_import(

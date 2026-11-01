@@ -46,6 +46,23 @@ impl Media {
             .or_else(|| self.title.english.clone())
             .unwrap_or_else(|| format!("AniList #{}", self.id))
     }
+
+    /// e.g. "Fall 2026".
+    pub fn season_label(&self) -> Option<String> {
+        match (&self.season, self.season_year) {
+            (Some(s), Some(y)) => {
+                let lower = s.to_lowercase();
+                let mut c = lower.chars();
+                let cap: String = c
+                    .next()
+                    .map(|f| f.to_uppercase().chain(c).collect())
+                    .unwrap_or_default();
+                Some(format!("{cap} {y}"))
+            }
+            (None, Some(y)) => Some(y.to_string()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

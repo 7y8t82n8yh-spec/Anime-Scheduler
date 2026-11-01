@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::time::Duration;
 
-use crate::SharedState;
+use crate::{model::FromMedia, SharedState};
 
 /// Re-fetch airing info for every tracked anime. Returns the number of notifications created.
 pub async fn refresh_all(state: &SharedState) -> Result<usize> {
@@ -44,7 +44,7 @@ async fn next_delay(state: &SharedState) -> Duration {
         .await
         .anime
         .values()
-        .filter(|a| a.status.notifies())
+        .filter(|a| a.status.is_active())
         .filter_map(|a| a.airing.next_airing_at)
         .min();
     match soonest {

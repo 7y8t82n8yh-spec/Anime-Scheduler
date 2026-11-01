@@ -1,0 +1,15 @@
+# Build the WebAssembly frontend:  trunk build --release
+# The server (cargo run -p anime-scheduler) serves frontend/dist.
+[build]
+target = "index.html"
+dist = "dist"
+
+# `trunk serve` for live-reload development; API calls are proxied to the server.
+[serve]
+port = 8080
+
+[[proxy]]
+backend = "http://127.0.0.1:3000/api/"
+
+[[proxy]]
+backend = "http://127.0.0.1:3000/auth/"

@@ -1,21 +1,23 @@
-[package]
-name = "anime-scheduler"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = ["shared", "server", "frontend"]
+default-members = ["shared", "server"]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
-description = "Self-hosted web app to track the anime you want to watch, what's aired, and what's next"
 license = "MIT"
 
-[dependencies]
-anyhow = "1"
-axum = "0.8"
-chrono = { version = "0.4", features = ["serde"] }
-rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+[workspace.dependencies]
+anime-shared = { path = "shared" }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[dev-dependencies]
-tempfile = "3"
+[profile.release.package.anime-frontend]
+opt-level = "z"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

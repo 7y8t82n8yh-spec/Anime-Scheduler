@@ -1,0 +1,23 @@
+[package]
+name = "anime-scheduler"
+description = "Self-hosted web app to track the anime you want to watch, what's aired, and what's next"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anime-shared.workspace = true
+anyhow = "1"
+axum = "0.8"
+chrono.workspace = true
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
